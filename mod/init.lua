@@ -1,4 +1,6 @@
 local ffi = require("ffi")
+ffi.cdef("int test(int);")
 local dll = ffi.load("mods/api_mod/api_mod.dll")
 local io = require("io")
-io.write("Loaded!!!")
+io.write("Loaded!!!\n")
+io.write("Output: ", dll.test(10), "!!!\n")
