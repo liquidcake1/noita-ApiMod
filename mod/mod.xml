@@ -1,0 +1,6 @@
+<Mod
+        name="API Mod"
+        description="This mod lets mods after it expose features to each other in a flexible way."
+        request_no_api_restrictions="1"
+>
+</Mod>
