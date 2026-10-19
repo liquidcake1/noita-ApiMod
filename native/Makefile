@@ -3,8 +3,16 @@
 #                   Optimisations  Enable warnings  Fail on warnings  Make DLL  Strip symbols  Include GCC gumf (probably missing on Windows)
 BUILD_OPTS=-std=c99 -O2            -Wall            -Werror           -shared   -s             -static-libgcc
 CC=i686-w64-mingw32-gcc-win32
+DLLTOOL=i686-w64-mingw32-dlltool
 
 all: api_mod.dll
 
-api_mod.dll: api_mod.c
-	$(CC) $(BUILD_OPTS) -o api_mod.dll api_mod.c
+lua51.a: lua51.def
+	$(DLLTOOL) --dllname lua51.dll --input-def lua51.def --output-lib lua51.a
+
+api_mod.dll: lua51.a api_mod.c
+	$(CC) $(BUILD_OPTS) -Iluajit/src -o api_mod.dll api_mod.c lua51.a
+
+.PHONY:
+clean: .PHONY
+	rm -f api_mod.dll liblua51.a
