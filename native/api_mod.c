@@ -7,35 +7,54 @@ static lua_State *my_global;
 
 #define DEBUG 0
 
+// TODO can we avoid this?
+#define MAXMULTRET 5;
+
+/**
+ * Userdata structures for a proxy for obj:
+ *   In the owner state, a ProxyFinaliser pf. Its job is only to tell the remote that the owner has been destroyed.
+ *   In the caller state, a RemoteProxy rp. It's exposed to Lua and has a metatable to allow calls through to owner.
+ *
+ * Wiring (& = lightuserdata, plain = real userdata or plain object):
+ *   owner:registry[&rp] = original        // Acts as a keepalive for original, and lookup to resolve rp
+ *   owner:registry[caller][original] = pf // Acts as keepalive for pf and cache for re-proxying (pf has pointer to rp).
+ *   caller:registry:cache                 // This (REMOTE_PROXY_LOOKUP_KEY) is a weak _value_ table, so that we can gc when the last reference goes away.
+ *   caller:registry:cache[&rp] = rp       // To allow owner to resolve a cached &rp to the real userdata.
+ *
+ * Call semantics, from caller:
+ *   * caller does eg. proxy(foo)
+ *   * Lua resolves to rp's metatable __call, does a pcall to
+ *   * remote_proxy__call, which checks args and passes (c call) to
+ *   * remote_proxy_inner(..., func=remote_proxy__call_inner, ...), which sets up and passes (c call) to
+ *   * pcall_transfer, which sets up and passes (Lua cpcall to owner) to...
+ *   * In owner (with semantics that errors here error caller, too -- it's OK to meddle with both stacks):
+ *     * pcall_transfer_internal, which
+ *     * transfers all args into owner using transfer(). This may do further cpcalls back into caller, as for anything that needs a proxy we need to modify both states.
+ *     * clears the entire stack of caller.
+ *     * Passes to func=remote_proxy__call_inner (in this case) which can be Lua or C.
+ *     * transfers all returns back into caller using transfer(). Again, this may do further pcalls.
+ *   * Back in caller, assuming no exception is raised, the stack is exactly the transferred return values, so we return.
+ *
+ * Transfer semantics:
+ *   * Basic types (nil, number, boolean, string) are simply copied.
+ *   * Tables become RemoteProxy.
+ *   * Functions become RemoteProxy.
+ *   * RemoteProxy userdata becomes the real object (if sent to owner state) or a RemoteProxy in the dest (otherwise).
+ *   * Other userdata is rejected for now (TODO this could just become a RemoteProxy, too?).
+ *   * You can't copy a lightuserdata (TODO we allow this; I don't think we need it -- we do use lud in calls, but only for known positional args).
+ *   * You can't copy a thread.
+ *
+ * TODO: We need to resolve threads to their owning state, as a proxy created by a thread will bear reference to the thread, which can get garbage collected and leave us hanging.
+ */
+
+// Left to do:
+//
+// For metatables, can "name" types using luaL_newmetatable. It seems like a PITA to make sure there's no collision, though?
+
 // userdata held in a "remote" lua_State to facilitate proxy calls
 struct RemoteProxy {
 	bool dead;  // Unusable if true.
 	lua_State *owner;
-	bool is_table; // true for table, false for function.
-	// We know (lua_State L, RemoteProxy p).
-	// If dead, never do anything -- owner is invalid.
-	// We __call (not is_table) by proxy call to original = owner:registry[&p]
-	// We __index (is_table) by proxy gettable to original = owner:registry[&p]
-	// We __newindex (is_table) by proxy settable to original = owner:registry[&p]
-	// We __gc by:
-	//   Destroy owner:registry[L][original] (this is a lud to us)
-	//   Destroy owner:registry[L] (if empty)
-	//   Destroy owner:registry[&p] (this will set our dead, but that's OK).
-	// proxy_cache is needed else proxies needs a list of finalisers. This is fine, but inefficient.
-	// To make a new proxy for original in owner for L, either:
-	//   Obtain owner:registry[L][original]
-	//     Look it up in caller:registry to return RemoteProxy real
-	//   Or do all of:
-	//     Create a userdata RemoteProxy p in the calling state.
-	//     Proxy call to owner, and:
-	//       Create a userdata ProxyFinaliser f
-	//       Install owner:registry[&p] = f
-	//       Install owner:registry[L][original] = p // keepalive to original plus cache
-	//       Install caller:registry[&p] = p // to allow lookup
-	//       Set the metatable of f to owner:registry:proxyteardown
-	//     Set the metatable of p to caller:registry:proxy
-	//     Add caller:registry:proxy_cache[p]
-	// When proxying a proxy, go back to the original and proxy that instead.
 };
 
 // userdata held in an "owner" lua_State to facilitate safety over death.
@@ -46,6 +65,114 @@ struct ProxyFinaliser {
 	//   Set other->dead
 	// We don't need anything else.
 };
+
+struct ProxyRequest {
+	RemoteProxy *rp;
+	lua_State *to;
+};
+
+void *check_userdata(lua_State *raise_errors_in, lua_State *L, int idx, void *table_key) {
+	void *ud = lua_touserdata(from, idx);
+	if (ud == NULL) {
+		lua_pushstring(raise_errors_in, "check_userdata: Param must be lua_State *");
+		lua_error(raise_errors_in);
+	}
+	if (lua_getmetatable(L, idx) == 0) {
+		lua_pushstring(raise_errors_in, "check_userdata: No metatable");
+		lua_error(raise_errors_in);
+	}
+	lua_pushlightuserdata(L, table_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if (!lua_rawequal(L, -1, -2)) {
+		lua_pop(L, 2);
+		lua_pushstring(raise_errors_in, "check_userdata: Wrong metatable (type is incorrect)");
+		lua_error(raise_errors_in);
+	}
+	lua_pop(L, 2);
+	return ud;
+}
+
+RemoteProxy *check_remote_proxy(lua_State *raise_errors_in, lua_State *L, int idx) {
+	RemoteProxy *rp = (RemoteProxy *)check_userdata(L, idx, &REMOTE_PROXY_KEY);
+	if (rp->dead) {
+		lua_pushstring(raise_errors_in, "check_remote_proxy: Proxy is dead (host lua_State has been finalised).");
+		lua_error(raise_errors_in);
+	}
+	return rp;
+}
+
+// Finalisers: ffi finalisers run first, then userdata finalisers, then once
+// all the userdata is gone, the rest of the state is deleted (__gc of non
+// userdata does not run as at this point it cannot affect the outside world).
+
+// The owning state is going away, or the RemoteProxy has been garbage collected.
+// We don't hold any light userdata here, but we need to break the remote object.
+static void proxy_finaliser__gc(lua_State *from) {
+	// The owner has died.
+	ProxyFinaliser *pf = (ProxyFinaliser *)check_userdata(from, from, -1, &PROXY_FINALISER_KEY);
+	// Congrats, pf _is_ a ProxyFinaliser!
+	if (pf->dead) {
+		return;
+	}
+	pf->other->dead = true;
+}
+
+static void remote_proxy__gc_from(lua_State *from) {
+	lua_State *to = (lua_State*)lua_touserdata(from, 1);
+	if (to == NULL) {
+		lua_pushstring(to, "remote_proxy__gc_from: Param must be lua_State*");
+		lua_error(to);
+	}
+	RemoteProxy *rp = (RemoteProxy*)lua_touserdata(to, 1);
+	// We're just going to trust this one is wired right.
+	lua_checkstack(from, 4);
+	lua_pushlightuserdata(from, rp);
+	lua_rawget(from, LUA_REGISTRYINDEX);
+	// to: [obj]
+	lua_pushlightuserdata(from, rp);
+	lua_pushnil(from);
+	lua_rawset(from, LUA_REGISTRYINDEX); // Delete from:registry[&rp]
+	// to: [obj]
+	lua_pushlightuserdata(from, to);
+	lua_rawget(from, LUA_REGISTRYINDEX);
+	// to: [obj, proxy cache for to]
+	lua_pushvalue(from, -2);
+	lua_rawget(from, -2);
+	// to: [obj, proxy cache for to, pf]
+	ProxyFinaliser *pf = (RemoteProxy*)lua_touserdata(from, 1);
+	pf->dead = true; // Don't let its GC talk to rp, which is about to be freed.
+	lua_pop(from, 1);
+	// to: [obj, proxy cache for to]
+	lua_pushvalue(from, -2);
+	lua_pushnil(from);
+	lua_rawset(from, -3); // Delete (proxy cache for to)[obj]
+	// to: [obj, proxy cache for to]
+	if (lua_objlen(from, 1) == 0) {
+		// Unlink the to state entirely if it's going to be empty.
+		lua_pushlightuserdata(from, to);
+		lua_pushnil(from);
+		lua_rawset(from, LUA_REGISTRYINDEX); // Delete from:registry[to]
+	}
+	lua_pop(from, 2);
+}
+
+// All references to the RemoteProxy have gone away (or the remote is in lua_close)
+// We need to break and remove the finaliser, and remove the upstream cache.
+// We also need to remove our local cache.
+static void remote_proxy__gc(lua_State *to) {
+	RemoteProxy *rp = (RemoteProxy *)check_userdata(to, to, -1, &REMOTE_PROXY_KEY);
+	// Congrats, pf _is_ a RemoteProxy!
+	if (rp->dead) {
+		// Other state has died already.
+		return;
+	}
+	rp->dead = true; // Shouldn't be needed as no references to rp will exist after this.
+	lua_State *from = rp->owner;
+	lua_pushlightuserdata(from, rp);
+	lua_pushnil(from);
+	lua_rawset(from, LUA_REGISTRYINDEX); // Delete from:registry[&rp]
+	remote_cpcall(to, from, remote_proxy__gc_from);
+}
 
 static void remote_pcall(lua_State *raise_errors_in, lua_State *call, int nargs, int nresults) {
 	if (lua_pcall(call, nargs, nresults, 0)) {
@@ -79,12 +206,13 @@ static int setup_outgoing_proxy_cache_for(lua_State *from) {
 	return 1;
 }
 
-// Action: in from, ensure there is proxy cache for to.
+// Action: in from, ensure there is proxy cache for to, and leave it at the top of the stack
 // before: from: [] + 3
 // after: from: [proxy cache for to]
+// We're running in raise_errors_in, but have "some" stack leeway in from (TODO), and raising here will clear from's state.
 static void ensure_outgoing_proxy_cache_for(lua_State *raise_errors_in, lua_State *from, lua_State *to) {
 	lua_pushlightuserdata(from, to);
-	lua_rawget(from, -2);
+	lua_rawget(from, LUA_REGISTRYINDEX);
 	// from: [proxy cache for to or nil]
 	if (!lua_isnil(from, -1)) {
 		return;
@@ -97,15 +225,80 @@ static void ensure_outgoing_proxy_cache_for(lua_State *raise_errors_in, lua_Stat
 	} else {
 		lua_pushcfunction(from, setup_outgoing_proxy_cache_for);
 		lua_pushlightuserdata(from, to);
-		remote_pcall(to, from, 1, 1, 0);
+		remote_pcall(to, from, 1, 1, 0); // We prefer pcall to cpcall because we're meant to put the cache on the stack to save the caller looking it up again.
 	}
 }
 
-// In the state of to, make a userdata RemoteProxy which points at from.
-// Before: to: [] + 3, from: [] + 0
-// After: to: [RemoteProxy], from: [RemoteProxy*]
+// Either make a new RemoteProxy metatable, or use the existing one if it's there. Leave it on the stack.
+static int REMOTE_PROXY_METATABLE_KEY; // Unique address to use as index. Value irrelevant.
+void ensure_remote_proxy_metatable(lua_State *to) {
+	lua_pushlightuserdata(to, &REMOTE_PROXY_METATABLE_KEY);
+	lua_rawget(to, LUA_REGISTRYINDEX);
+	if (lua_isnil(to, -1)) {
+		lua_pop(to, 1);
+		lua_newtable(to);
+		lua_pushstring(to, "__gc");
+		lua_pushcfunction(to, remote_proxy__gc);
+		lua_rawset(to, -3);
+		lua_pushstring(to, "__call");
+		lua_pushcfunction(to, remote_proxy__call);
+		lua_rawset(to, -3);
+		lua_pushstring(to, "__index");
+		lua_pushcfunction(to, remote_proxy__index);
+		lua_rawset(to, -3);
+		lua_pushstring(to, "__metatable");
+		lua_pushnil(to);
+		lua_rawset(to, -3); // DISABLES fetching metatable
+		lua_pushlightuserdata(to, &REMOTE_PROXY_METATABLE_KEY);
+		lua_pushvalue(to, -2);
+		lua_rawset(to, LUA_REGISTRYINDEX);
+	}
+}
+
+// Either make a new ProxyFinaliser metatable, or use the existing one if it's there. Leave it on the stack.
+static int PROXY_FINALISER_METATABLE_KEY; // Unique address to use as index. Value irrelevant.
+void ensure_proxy_finaliser_metatable(lua_State *from) {
+	lua_pushlightuserdata(from, &PROXY_FINALISER_METATABLE_KEY);
+	lua_rawget(from, LUA_REGISTRYINDEX);
+	if (lua_isnil(from, -1)) {
+		lua_pop(from, 1);
+		lua_newtable(from);
+		lua_pushstring(from, "__gc");
+		lua_pushcfunction(from, remote_proxy__gc);
+		lua_rawset(from, -3);
+		lua_pushstring(from, "__metatable");
+		lua_pushnil(from);
+		lua_rawset(from, -3); // DISABLES fetching metatable
+		lua_pushlightuserdata(from, &PROXY_FINALISER_METATABLE_KEY);
+		lua_pushvalue(from, -2);
+		lua_rawset(from, LUA_REGISTRYINDEX);
+	}
+}
+
+static int REMOTE_PROXY_LOOKUP_KEY; // Unique address to use as index. Value irrelevant.
+// Either make a new weak key cache table, or use the existing one if it's there. Leave it on the stack.
+void ensure_weak_remote_proxy_lookup(lua_State *to) {
+	lua_pushlightuserdata(to, &REMOTE_PROXY_LOOKUP_KEY);
+	lua_rawget(to, LUA_REGISTRYINDEX);
+	if (lua_isnil(to, -1)) {
+		lua_pop(to, 1);
+		lua_newtable(to); // cache
+		lua_newtable(to); // mt
+		lua_pushstring(to, "__mode");
+		lua_pushstring(to, "v");
+		lua_rawset(to, -3); // mt["__mode"] = "v"
+		lua_setmetatable(to, -2); // cache.mt = mt
+		lua_pushvalue(to, -1); // copy cache
+		lua_pushlightuserdata(to, &REMOTE_PROXY_LOOKUP_KEY);
+		lua_rawset(to, LUA_REGISTRYINDEX);
+	}
+}
+
+// In the state of to, make a userdata RemoteProxy which points at from, and leave it at the top of the stack.
+// Before: to: [...]
+// After: to: [..., RemoteProxy]
 static RemoteProxy *new_remote_proxy_inner(lua_State *to, lua_State *from) {
-	// lua_checkstack(to, 2);
+	lua_checkstack(to, 3);
 	RemoteProxy *rp = (RemoteProxy*)lua_newuserdata(to, sizeof(RemoteProxy));
 	if (rp == NULL) {
 		lua_pushstring(to, "new_remote_proxy_inner: Could not allocate");
@@ -113,13 +306,14 @@ static RemoteProxy *new_remote_proxy_inner(lua_State *to, lua_State *from) {
 	}
 	rp->dead = true;
 	rp->owner = from;
-	// TODD rp->is_table = ??? -- do we even need this? We can just choose the metatable based on it?
-	lua_newtable(to); // TODO initialise! // TODO lua_newmetatable?
+	ensure_remote_proxy_metatable(to);
 	lua_setmetatable(to, -2);
 	// to: [RemoteProxy], from: []
-	lua_pushvalue(to, -1);
-	lua_pushvalue(to, -1);
-	lua_rawset(to, LUA_REGISTRYINDEX); // to:registry[rp] = rp // TODO defer this and push placeholder then nil? Otherwise need to clean up or leak.
+	ensure_weak_remote_proxy_lookup(to);
+	lua_pushlightuserdata(to, rp);
+	lua_pushvalue(to, -3);
+	lua_rawset(to, -3); // to:registry:cache[&rp] = rp
+	lua_pop(to, 1);
 	// to: [RemoteProxy], from: []
 	return rp;
 }
@@ -127,8 +321,6 @@ static RemoteProxy *new_remote_proxy_inner(lua_State *to, lua_State *from) {
 // lua_CFunction.
 // Params: [from]
 // Return: [RemoteProxy]
-// Before: from: [] + 0
-// After: from: []
 static int new_remote_proxy(lua_State *to) {
 	lua_State *from = (lua_State *)lua_touserdata(to, -1);
 	if (from == NULL) {
@@ -141,74 +333,71 @@ static int new_remote_proxy(lua_State *to) {
 }
 
 // In the state of from, make a userdata ProxyFinaliser which points at to's RemoteProxy.
-// Before: from: [] + 3
-// After: from: []
-static RemoteProxy *new_proxy_finaliser_inner(lua_State *from, RemoteProxy *rp) {
-	// lua_checkstack(to, 2);
-	ProxyFinaliser *rp = (ProxyFinaliser*)lua_newuserdata(from, sizeof(ProxyFinaliser));
-	if (rp == NULL) {
+// We don't return it, it's needed only to GC.
+// Before: from: [..., proxy cache for to, obj, RemoteProxy*] + 4
+// After: from: [...]
+static RemoteProxy *new_proxy_finaliser_inner(lua_State *from) {
+	RemoteProxy *rp = (RemoteProxy*)lua_touserdata(from, -1);
+	lua_pop(from, 1);
+	ProxyFinaliser *pf = (ProxyFinaliser*)lua_newuserdata(from, sizeof(ProxyFinaliser));
+	if (pf == NULL) {
 		lua_pushstring(from, "new_remote_proxy_inner: Could not allocate");
 		lua_error(from);
 	}
 	pf->dead = true;
 	pf->other = rp;
-	lua_newtable(from); // TODO initialise! // TODO lua_newmetatable?
+	ensure_proxy_finaliser_metatable(from); // Needs 3 space
 	lua_setmetatable(from, -2);
-	// from: [ProxyFinaliser]
-	lua_pushvalue(from, rp);
-	lua_pushvalue(from, -2);
-	lua_rawset(from, LUA_REGISTRYINDEX); // from:registry[rp] = pf // TODO defer this? Otherwise we can leak?
-	// from: [ProxyFinaliser]
+	// from: [proxy cache for to, obj, ProxyFinaliser]
+	lua_pushlightuserdata(from, rp);
+	lua_pushvalue(from, -3);
+	lua_rawset(from, LUA_REGISTRYINDEX); // from:registry[&rp] = obj // TODO defer this? A crash after will leak obj forever...
+	// from: [proxy cache for to, obj, ProxyFinaliser]
+	lua_rawset(from, -3); // from:registry[to][obj] = pf // TODO similarly, this will also leak obj and pf if we crash...
 	lua_pop(from, 1);
 	return pf;
 }
 
 // lua_CFunction.
-// Params: [proxy_cache for to, obj, RemoteProxy *]
+// Params: [proxy_cache for to, obj, RemoteProxy*]
 // Return: []
 static int new_proxy_finaliser(lua_State *from) {
-	luaL_checktype(from, 1, LUA_TTABLE);
-	RemoteProxy *rp = (RemoteProxy *)lua_touserdata(from, 3);
-	if (rp == NULL) {
-		lua_pushstring(from, "new_proxy_finaliser: First parameter must be RemoteProxy*");
-		lua_error(from);
-	}
-	lua_pop(from, 1);
-	lua_rawset(from, LUA_REGISTRYINDEX); // from:registry[L][obj] = rp
-	new_remote_proxy_inner(from, rp);
+	ProxyFinaliser pf = new_proxy_finaliser_inner(from, rp);
 	return 0;
 }
 
 // Before: from: [obj, ...]; to: []
 // After: from: [obj, ...]; to: [RemoteProxy for p]
 static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *from, int idx) {
-	// TODO type check that obj can be proxied.
+	if (idx < 0) {
+		// Convert to absolute.
+		idx = lua_gettop(from) + 1 + idx;
+	}
 	// from: [obj, ...], to: []
 	ensure_outgoing_proxy_cache_for(raise_errors_in, from, to);
 	// from: [obj, ..., proxy cache for to]; to: []
-	lua_pushvalue(from, idx - 1);
+	lua_pushvalue(from, idx);
 	lua_rawget(from, -2);
-	// from: [obj, ..., proxy_cache for to, RemoteProxy* for obj or nil], to: []
+	// from: [obj, ..., proxy_cache for to, ProxyFinaliser for obj or nil], to: []
 	if (!lua_isnil(from, -1)) {
-		// We do have a proxy, but we need to make a full proxy.
-		// from: [obj, ..., proxy_cache for to, RemoteProxy* for obj], to: []
-		RemoteProxy *rp = (RemoteProxy*)lua_touserdata(from, -1);
-		if (rp == NULL) {
-			// Should not happen.
-			lua_pushstring(raise_errors_in, "create_proxy: proxy cache was not a lightuserdata");
+		// from: [obj, ..., proxy_cache for to, ProxyFinaliser for obj], to: []
+		ProxyFinaliser *pf = (ProxyFinaliser*)check_userdata(raise_errors_in, from, -1, &PROXY_FINALISER_METATABLE_KEY);
+		if (pf->dead) {
+			// Sanity check: Should happen only after to's RemoteProxy was gc-ed, but that should also delete the lookup!
+			// It _could_ happen if the gc crashed midway, perhaps. We could recover by deleting here and then making a new one.
+			lua_pushstring(raise_errors_in, "create_proxy: ProxyFinaliser was dead");
 			lua_error(raise_errors_in);
-		} else if (rp->dead) {
-			// Should happen only after from dies, so again, not ever if we're here...
-			lua_pushstring(raise_errors_in, "create_proxy: proxy cache was dead");
-			lua_error(raise_errors_in);
-		} else {
-			lua_pushlightuserdata(to, rp);
-			lua_rawget(to, LUA_REGISTRYINDEX);
-			// from: [obj, ..., proxy_cache for to, RemoteProxy* for obj], to: [RemoteProxy for obj]
-			lua_pop(from, 2);
-			// from: [obj, ...], to: [RemoteProxy for obj]
-			return;
 		}
+		// We do have a proxy; look it up in to to upgrade it to a full one.
+		lua_pop(from, 2);
+		// from: [obj, ...], to: []
+		lua_pushlightuserdata(to, &REMOTE_PROXY_LOOKUP_KEY);
+		lua_rawget(to, LUA_REGISTRYINDEX); // Note if the RemoteProxy exists, the cache table must, too.
+		lua_pushlightuserdata(to, pf->other);
+		lua_rawget(to, -2); // Convert to real userdata
+		lua_remove(to, -2); // Remove cache table from stack
+		// from: [obj, ...], to: [RemoteProxy for obj]
+		return;
 	}
 
 	lua_pop(from, 1);
@@ -216,12 +405,11 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 	// We don't have a proxy for this object.
 	// First, get a RemoteProxy in *to
 	if (raise_errors_in == to) {
-		// TODO from must have 1 free, to must have 3 free
 		RemoteProxy *rp = new_remote_proxy_inner(to, from);
 		// from: [obj, ..., proxy cache for to], to: [RemoteProxy for obj]
 		lua_pushcfunction(from, new_proxy_finaliser);
 		lua_insert(from, -2);
-		lua_pushvalue(from, idx - 2);
+		lua_pushvalue(from, idx);
 		lua_pushlightuserdata(from, rp);
 		remote_pcall(to, from, 3, 1);
 		// from: [obj, ...], to: [RemoteProxy for obj]
@@ -230,22 +418,16 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 		pf->dead = false;
 	} else {
 		// We're in from, so need to pcall to.
-		// TODO from must have 1 free, to must have 3 free
-		lua_pushcfunction(from, new_remote_proxy);
-		lua_pushlightuserdata(from, to);
+		lua_pushcfunction(to, new_remote_proxy);
+		lua_pushlightuserdata(to, from);
 		remote_pcall(from, to, 1, 1);
 		RemoteProxy *rp = lua_touserdata(to, -1);
 		lua_pushlightuserdata(from, rp);
 		// from: [obj, ..., proxy_cache for to, RemoteProxy* for obj], to: [RemoteProxy for obj]
 
-		// TODO we need an extra 1 for from here.
-		lua_pushvalue(from, idx - 2);
+		lua_pushvalue(from, idx);
 		lua_insert(from, -2);
-		lua_rawset(from, -3); // from:registry[L][obj] = rp
-		lua_pop(from, 1);
-		// from: [obj, ...]; to: [RemoteProxy for obj]
-
-		ProxyFinaliser* pf = new_proxy_finaliser_inner(from, rp);
+		ProxyFinaliser* pf = new_proxy_finaliser_inner(from, rp, idx);
 		// from: [obj, ...], to: [RemoteProxy for obj]
 
 		rp->dead = false;
@@ -253,10 +435,44 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 	}
 }
 
-// Running in incoming (so don't change outgoing's stack!), copy outgoing stack index idx to the top of incoming's stack.
+// In state to, copy string at idx in from to top of to.
+void copy_string_inner(lua_State *to, lua_State *from, int idx) {
+	size_t len;
+	// Allegedly this can raise a memory error, but I think only if
+	// it's not already a string.
+	//
+	// Checking the _current_ luajit source, that's the case -- it
+	// either straight returns if it's a string, or if it's a
+	// number, does a string conversion into the string table,
+	// which can throw a memory error.
+	//
+	// So it can't raise here, as we know it's already a string.
+	// Woohoo!
+	const char *s = lua_tolstring(from, idx, &len);
+	if (DEBUG) fprintf(stderr, "Transferring a string from %lx to %lx: %s\n", (long)from, (long)to, s);
+	lua_pushlstring(to, s, len);
+}
+
+int copy_string(lua_State *to) {
+	lua_State *from = (lua_State*)lua_touserdata(to, 1);
+	copy_string_inner(to, from, -1);
+	return 1;
+}
+
+// When we're in "other" and need to re-proxy something from "from" to "to", we call into "from" to get the ball rolling.
+int create_proxy_for(lua_State *from) {
+	ProxyRequest *pr = (ProxyRequest *)lua_touserdata(from, 1);
+	lua_pushlightuserdata(from, pr->rp);
+	lua_rawget(from, LUA_REGISTRYINDEX); // Look up to get the real object.
+	create_proxy(from, pr->to, from, -1);
+	return 0;
+}
+
+// Copy outgoing stack index idx to the top of to's stack.
+// We assume there is space in to's stack for the object, but errors must only occur in raise_errors_in, which could be either.
 // Assumption:
 // * to has enough stack space.
-// * errors raised in to will not corrupt the stack (ie. errors will bubble up to a pcall in to's state)
+// * errors raised in raise_errors_in will bubble to both to and from, so their stack is ours.
 static void transfer_index(lua_State *raise_errors_in, lua_State *to, lua_State *from, int idx) {
 	switch(lua_type(from, idx)) {
 	case LUA_TNIL:
@@ -272,36 +488,56 @@ static void transfer_index(lua_State *raise_errors_in, lua_State *to, lua_State 
 		if (DEBUG) fprintf(stderr, "Transferring a bool from %lx to %lx: %i\n", (long)from, (long)to, lua_toboolean(from, idx));
 		break;
 	case LUA_TSTRING:
-		// Allegedly this can raise a memory error, but I think only if
-		// it's not already a string.
-		//
-		// Checking the _current_ luajit source, that's the case -- it
-		// either straight returns if it's a string, or if it's a
-		// number, does a string conversion into the string table,
-		// which can throw a memory error.
-		//
-		// So it can't raise here, as we know it's already a string.
-		// Woohoo!
-		size_t len;
-		const char *s = lua_tolstring(from, idx, &len);
-		if (DEBUG) fprintf(stderr, "Transferring a string from %lx to %lx: %s\n", (long)from, (long)to, s);
-		// TODO this can raise, so needs pcall proxying if raise_errors_in != to
-		// We'll need to push &idx.
-		lua_pushlstring(to, s, len);
+		if (raise_errors_in == to) {
+			copy_string_inner(to, from, idx);
+		} else {
+			lua_pushvalue(from, idx);
+			lua_pushcfunction(to, copy_string);
+			lua_pushlightuserdata(to, from);
+			remote_pcall(raise_errors_in, to, 1, 1);
+			lua_pop(from, 1);
+		}
 		break;
 	case LUA_TTABLE:
 		create_proxy(raise_errors_in, to, from, idx);
-		break; // Unreachable
+		break;
 	case LUA_TFUNCTION:
 		create_proxy(raise_errors_in, to, from, idx);
-		break; // Unreachable
+		break;
 	case LUA_TLIGHTUSERDATA:
 		if (DEBUG) fprintf(stderr, "Transferring a lightuserdata from %lx to %lx. I hope you know what you're doing.\n", (long)from, (long)to);
 		lua_pushlightuserdata(to, lua_touserdata(from, idx));
 		break;
-	case LUA_TTHREAD:
 	case LUA_TUSERDATA:
-		lua_pushstring(raise_errors_in, "Will not proxy a userdata or thread.");
+		// If this is a RemoteProxy in from, and the RemoteProxy's real object lives in to, resolve it to the real thing.
+		// If the real object lives elsewhere, create a new proxy from _there_ to to.
+		lua_getmetatable(from, idx);
+		lua_pushlightuserdata(from, &REMOTE_PROXY_METATABLE_KEY);
+		lua_rawget(from, LUA_REGISTRYINDEX);
+		if (!lua_rawequal(-1, -2)) {
+			// Honestly we could. Our proxy metatable would just work. Main issue is that we don't want to proxy __newindex on tables.
+			// For now, let's just assume doing this is kinda insane and so not.
+			lua_pushstring(raise_errors_in, "Will not proxy an arbitrary userdata.");
+			lua_error(raise_errors_in);
+		}
+		lua_pop(from, 2);
+		RemoteProxy *rp = (RemoteProxy*)lua_touserdata(from, idx);
+		if (rp->dead) {
+			// It's dead, Fred. So I guess we'll just make another dead one in the target...
+			lua_pushcfunction(to, new_remote_proxy);
+			lua_pushlightuserdata(to, rp->owner);
+			remote_pcall(raise_errors_in, to, 1, 1);
+		} else if (rp->owner == to) {
+			// Convert it back to the real object.
+			lua_pushlightuserdata(to, rp);
+			lua_rawget(to, LUA_REGISTRYINDEX);
+		} else {
+			// It's for some third state. We don't own that state's stack, so time for some magic...
+			struct ProxyRequest pr = {rp, to};
+			handle_error_from(raise_errors_in, rp->owner, lua_cpcall(rp->owner, create_proxy_for, &pr));
+		}
+	case LUA_TTHREAD:
+		lua_pushstring(raise_errors_in, "Will not proxy a thread.");
 		lua_error(raise_errors_in);
 		break; // Unreachable
 	default:
@@ -323,53 +559,65 @@ static void handle_error_from(lua_State *raise_to, lua_State *ran_in, int retval
 		// So it cannot raise.
 		const char *s = lua_tolstring(ran_in, -1, &len);
 		if (DEBUG) fprintf(stderr, "handle_error_from: Error is %s\n", s);
-		lua_pushlstring(raise_to, s, len);
+
+		const char *t = malloc(len);
+		if (t == NULL) {
+			// Well, we tried. Probably this fails too, as we're going to try to allocate that string, but it's Lua's problem at that point.
+			lua_pop(ran_in, 1);
+			lua_checkstack(raise_to, 1);
+			lua_pushstring(raise_to, "handle_error_from: Memory error while handling an error");
+			lua_error(raise_to);
+		}
+		memcpy(t, s, len);
 		lua_pop(ran_in, 1);
+
+		lua_checkstack(raise_to, 1);
+		lua_pushlstring(raise_to, s, len);
+		free(t); // If either of the above two raise (which they could if there were a memory error), we leak. We could fix with a pcall, but TBH if we're getting memory errors, it's probably over.
 		// raise_to: [..., error_str], ran_in: [...]
 		lua_error(raise_to);
 	}
 }
 
 // cpcall func in call_in with call_from as param, re-raising errors in call_from.
-void remote_cpcall(lua_State *call_in, lua_State *call_from, lua_CFunction func) {
+void remote_cpcall(lua_State *call_from, lua_State *call_in, lua_CFunction func) {
 	handle_error_from(call_from, call_in, lua_cpcall(call_in, func, call_from));
 }
 
-static int settable_with_idxptr(lua_State*);
-
-// Take over from lua_cpcall_transfer.
+// Take over from pcall_transfer, now in "call_in"'s state.
 // * call_in's stack must be [call_data_from as userdata].
 // * call_in's stack must be [lua_CFunction as userdata, arg1, ..., argn, &nargs as userdata, &nret as userdata].
-// * We must be allowed to modify the stack of call_in freely.
 // * We perform the guarantees of lua_cpcall_transfer excepting raising an error in call_data_from:
 //   - either call_in's stack is [ret1, ..., retn], or
 //   - an error is raised in call_in which should be reraised by lua_cpcall_transfer in call_data_from.
-static int lua_cpcall_transfer_internal(lua_State *call_in) {
+static int pcall_transfer_internal(lua_State *call_in) {
 	if (DEBUG) fprintf(stderr, "In lua_cpcall_transfer_internal (%lx)\n", (long)call_in);
 	luaL_checkany(call_in, 1);
 	lua_State *call_data_from = (lua_State *)lua_touserdata(call_in, -1);
+	lua_pop(call_in);
 
 	// call_in: []; call_data_from: [func as userdata, arg1, ..., argn, nargs as userdata, nret as userdata]
 	int nargs = *((int*)lua_touserdata(call_data_from, -2));
 	if (DEBUG) fprintf(stderr, "lua_cpcall_transfer_internal: nargs is %i\n", nargs);
 	int nret = *((int*)lua_touserdata(call_data_from, -1));
 	if (DEBUG) fprintf(stderr, "lua_cpcall_transfer_internal: nret is %i\n", nret);
+	lua_pop(call_data_from, 2);
 
 	lua_checkstack(call_in, nargs + 1);
 
 	// Grab nargs+1 deep as a userdata-encoded cfunction, and push it.
-	lua_CFunction func = (lua_CFunction)lua_touserdata(call_data_from, -nargs - 3);
+	lua_CFunction func = (lua_CFunction)lua_touserdata(call_data_from, -nargs - 1);
 	lua_pushcfunction(call_in, func);
 	if (DEBUG) fprintf(stderr, "lua_cpcall_transfer_internal: func is %lx; settable_with_idxptr is %lx\n", (long)func, (long)settable_with_idxptr);
 
 	// Then push the rest of the args, deepest first.
-	for(int i=-nargs - 2; i<-2; i++) {
+	for(int i=-nargs; i<nargs + 1; i++) {
 		if (DEBUG) fprintf(stderr, "lua_cpcall_transfer_internal: transfer %i\n", i);
 		transfer_index(call_in, call_in, call_data_from, i);
 	}
 
 	// Pop everything we just transfered or copied.
-	lua_pop(call_data_from, nargs + 3);
+	lua_settop(call_data_from, 0);
 	// call_in: [func as cfunction, arg1, ..., argn]; call_data_from: []
 
 	if (DEBUG) fprintf(stderr, "lua_cpcall_transfer_internal: Call!\n");
@@ -377,92 +625,91 @@ static int lua_cpcall_transfer_internal(lua_State *call_in) {
 	// call_in: [ret1, ..., retn]; call_data_from: []
 
 	// We already checked call_data_from has the stack space in lua_cpcall_transfer.
-	for(int i=-nret; i<0; i++) {
+	int nret = lua_gettop(call_in);
+	if (nret > MAXMULTRET) {
+		nret = MAXMULTRET;
+	}
+	for(int i=1; i < nret; i++) {
 		transfer_index(call_in, call_data_from, call_in, i);
 	}
-	lua_pop(call_in, nret);
+	lua_settop(call_in, 0);
 	// call_in: []; call_data_from: [ret1, ..., retn]
 	return 0;
 }
 
 // Call a lua function in call_in with data from call_data_from.
-// call_data_from must have the following stack (left is deepest):
-// [lua_CFunction as userdata, arg1, ..., argn]
+// call_data_from: [lua_CFunction as lightuserdata, arg1, ..., argn]
 // call_data_from stack must have enough room for 2 more elements right now, and for nret after the above is popped
 // Either:
 // * The whole listed stack (nargs + 3) of call_data_from will be popped, and nret items will be pushed, as with a pcall, or
-// * An error will be raised in both call_in and call_data_from.
+// * An error will be raised in call_data_from.
 // Either way, the stack of call_in will be left alone.
-static int lua_cpcall_transfer(lua_State *call_in, lua_State *call_data_from, int nargs, int nret) {
-	lua_checkstack(call_data_from, nargs + 3 + 2 > nret ? 2 : nret - nargs + 3);
+static int pcall_transfer(lua_State *call_data_from, lua_State *call_in, int nargs, int nret) {
+	const int already_there = lua_gettop(call_data_from);
+	if (nret == LUA_MULTRET) {
+		lua_checkstack(call_data_from, already_there + 2 > MAXMULTRET ? 2 : MAXMULTRET - already_there);
+	} else {
+		lua_checkstack(call_data_from, already_there + 1 > nret ? 2 : nret - already_there);
+	}
 	lua_pushlightuserdata(call_data_from, &nargs);
 	lua_pushlightuserdata(call_data_from, &nret);
-	if (DEBUG) fprintf(stderr, "Stack set up, about to remote_cpcall (lua_cpcall_transfer)\n");
-	remote_cpcall(call_in, call_data_from, lua_cpcall_transfer_internal);
-	if (DEBUG) fprintf(stderr, "remote_cpcall returned (lua_cpcall_transfer)\n");
+	if (DEBUG) fprintf(stderr, "Stack set up, about to remote_cpcall (pcall_transfer)\n");
+	remote_cpcall(call_data_from, call_in, pcall_transfer_internal);
+	if (DEBUG) fprintf(stderr, "remote_cpcall returned (pcall_transfer)\n");
 	return 0;
 }
 
-static int settable_with_idxptr(lua_State *table_owner) {
-	// table_owner: [key, value, &idx as userdata]
-	if (lua_type(table_owner, -1) != LUA_TLIGHTUSERDATA) {
-		// Error is raised in the current execution frame in table_owner, reraised in the calling one by handle_error_from.
-		if (DEBUG) fprintf(stderr, "Top of stack type is %i\n", lua_type(table_owner, -1));
-		lua_pushstring(table_owner, "Top of the stack must be a lightuserdata (int pointer).");
-		lua_error(table_owner);
-	}
-	int idx = *((int*)lua_touserdata(table_owner, -1));
-	lua_pop(table_owner, 1);
-	lua_settable(table_owner, idx);
-	return 0;
+// Common code for remote proxy metatable methods.
+// We're in "to"; the stack is [rp for obj, arg1, ..., argn]. After return, the stack is [ret1, ..., retn].
+static void remote_proxy_inner(lua_State *to, lua_CFunction func, int nargs, int nret) {
+	RemoteProxy *rp = check_remote_proxy(to, to, 1);
+
+	lua_checkstack(to, 1);
+	lua_pushlightuserdata(to, func);
+	lua_insert(to, 1);
+	// [remote_proxy__call_inner, rp for func, arg1, ..., argn]
+
+	pcall_transfer(to, rp->owner, nargs + 1, nret);
 }
 
-static int settable(lua_State *L) {
-	if (DEBUG) fprintf(stderr, "In settable\n");
-	luaL_checkany(L, 1); // key
-	luaL_checkany(L, 2); // value
-
-	lua_pushlightuserdata(L, settable_with_idxptr);
-	lua_pushvalue(L, 1); // key
-	lua_pushvalue(L, 2); // value
-	int idx = LUA_REGISTRYINDEX;
-	lua_pushlightuserdata(L, &idx);
-
-	// L: [key, value|settable_with_idxptr, key, value, &LUA_REGISTRYINDEX]
-	if (DEBUG) fprintf(stderr, "Stack set up, about to lua_cpcall_transfer\n");
-	lua_cpcall_transfer(my_global, L, 3, 0);
-	// L: [key, value|]
-	return 0;
-}
-
-static int gettable_with_idxptr(lua_State *table_owner) {
-	// table_owner: [key, &idx as userdata]
-	if (lua_type(table_owner, -1) != LUA_TLIGHTUSERDATA) {
-		// Error is raised in the current execution frame in table_owner, reraised in the calling one by handle_error_from.
-		if (DEBUG) fprintf(stderr, "Top of stack type is %i\n", lua_type(table_owner, -1));
-		lua_pushstring(table_owner, "Top of the stack must be a lightuserdata (int pointer).");
-		lua_error(table_owner);
-	}
-	int idx = *((int*)lua_touserdata(table_owner, -1));
-	lua_pop(table_owner, 1);
-	lua_gettable(table_owner, idx);
+// In "from", we're doing table[key] for a table proxied from "to". Proxying is handled by pcall_transfer.
+// Params: [table, key]
+// Return: [value]
+static int remote_proxy__index_inner(lua_State *from) {
+	lua_gettable(from, 1);
+	lua_remove(from, 1); // Remove the table from the stack, just to be clean.
 	return 1;
 }
 
-static int gettable(lua_State *L) {
-	luaL_checkany(L, 1);
-
-	lua_pushlightuserdata(L, gettable_with_idxptr);
-	lua_pushvalue(L, 1); // key
-	int idx = LUA_REGISTRYINDEX;
-	lua_pushlightuserdata(L, &idx);
-
-	// L: [key|rettable_with_idxptr, key, &LUA_REGISTRYINDEX]
-	lua_cpcall_transfer(my_global, L, 2, 1);
-	// L: [key|value]
-
-	return 1;
+// In "to", we're doing rp[key] on a RemoteProxy userdata.
+// Params: [rp for table, key]
+// Return: [transfer(table[transfer(key)])]
+static int remote_proxy__index(lua_State *to) {
+	if (lua_gettop(to) != 2) {
+		lua_checkstack(to, 1);
+		lua_pushstring(to, "remote_proxy__index: Wrong number of args");
+		lua_error(to);
+	}
+	return remote_proxy_inner(to, remote_proxy__index_inner, 2, 1);
 }
+
+// In "from", we're doing func(arg1, ..., argn) for a function proxied from "to". Proxying is handled by pcall_transfer.
+// Params: [func, arg1, ..., argn]
+// Return: [ret1, ..., retn]
+static int remote_proxy__call_inner(lua_State *from) {
+	int nargs = lua_gettop(from) - 1;
+	lua_call(from, nargs, LUA_MULTRET);
+	return lua_gettop(from); // return everything
+}
+
+// In "to", we're doing rp[key] on a RemoteProxy userdata.
+// Params: [rp for func, arg1, ..., argn]
+// Return: [transfer(table[transfer(key)])]
+static int remote_proxy__call(lua_State *to) {
+	int nargs = lua_gettop(to) - 1;
+	return remote_proxy_inner(to, remote_proxy__call_inner, nargs + 1, LUA_MULTRET);
+}
+
 
 static const luaL_Reg funcs[] = { {"settable", settable}, {"gettable", gettable}, {NULL, NULL} };
 
