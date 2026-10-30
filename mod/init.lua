@@ -25,6 +25,11 @@ io.write("atable: ", tostring(dll.gettable()["atable"]), "!!!\n")
 io.write("atable.foo: ", tostring(dll.gettable()["atable"].foo), "!!!\n")
 io.write("afunction: ", tostring(dll.gettable()["afunction"]), "!!!\n")
 io.write("afunction(2): ", tostring(dll.gettable()["afunction"](2)), "!!!\n")
+io.write("simple_userdata(): pre!!!\n")
+local val = dll.gettable()["simple_userdata"]()
+io.write("simple_userdata(): post!!!\n")
+io.write("simple_userdata(): ", tostring(val), "!!!\n")
+io.write("simple_userdata(): ", tostring(dll.gettable()["simple_userdata"]()), "!!!\n")
 ffidll.increment();
 ffidll.increment();
 ffidll.increment();
