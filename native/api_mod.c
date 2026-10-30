@@ -47,6 +47,10 @@ static lua_State *my_global;
  *   * You can't copy a thread.
  *
  * TODO: We need to resolve threads to their owning state, as a proxy created by a thread will bear reference to the thread, which can get garbage collected and leave us hanging.
+ * There are three fixes:
+ * * Hook lua_newstate (which we plan to do anyway -- it's the only way we're going to get data between states!).
+ * * Have some jank requirement that you need to proxy an object in your main thread first.
+ * * Have some super-jank thing where we keepalive the coroutine that created an object.
  */
 
 // Left to do:
