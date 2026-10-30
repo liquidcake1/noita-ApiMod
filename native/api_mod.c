@@ -53,6 +53,8 @@ static lua_State *my_global;
 //
 // For metatables, can "name" types using luaL_newmetatable. It seems like a PITA to make sure there's no collision, though?
 
+static int TMP_KEY; // Unique address to passaround return values using lua_cpcall.
+
 // userdata held in a "remote" lua_State to facilitate proxy calls
 static int REMOTE_PROXY_METATABLE_KEY; // Unique address to use as index. Value irrelevant.
 typedef struct RemoteProxy {
@@ -135,6 +137,25 @@ static void handle_error_from(lua_State *raise_to, lua_State *ran_in, int retval
 		// raise_to: [..., error_str], ran_in: [...]
 		lua_error(raise_to);
 	}
+}
+
+// Reinterpret userdata as cfunction and put it in TMP_KEY.
+static int pushcfunction_inner(lua_State *L) {
+	lua_CFunction func = (lua_CFunction)lua_touserdata(L, 1);
+	lua_pop(L, 1);
+	lua_pushlightuserdata(L, &TMP_KEY);
+	lua_pushcfunction(L, func);
+	lua_rawset(L, LUA_REGISTRYINDEX);
+	return 0;
+}
+
+// Get a lua_cfunction safely onto the stack of L, or raise in raise_errors_in
+// Bit of a hack, but it's "safe" in the sense that it cannot error locally.
+// Needs 1 stack in L, though lua_cpcall probably guarantees that.
+static void pushcfunction_from_outside(lua_State *raise_errors_in, lua_State *L, lua_CFunction func) {
+	handle_error_from(raise_errors_in, L, lua_cpcall(L, pushcfunction_inner, func));
+	lua_pushlightuserdata(L, &TMP_KEY);
+	lua_rawget(L, LUA_REGISTRYINDEX);
 }
 
 // cpcall func in call_in with call_from as param, re-raising errors in call_from.
@@ -261,7 +282,7 @@ static void ensure_outgoing_proxy_cache_for(lua_State *raise_errors_in, lua_Stat
 		setup_outgoing_proxy_cache_for_inner(from, to);
 		// from: [proxy cache for to]
 	} else {
-		lua_pushcfunction(from, setup_outgoing_proxy_cache_for);
+		pushcfunction_from_outside(to, from, setup_outgoing_proxy_cache_for);
 		lua_pushlightuserdata(from, to);
 		remote_pcall(to, from, 1, 1);
 		// from: [proxy cache for to]
@@ -461,7 +482,7 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 		lua_pushvalue(from, idx);
 		RemoteProxy *rp = new_remote_proxy_inner(to, from);
 		// from: [obj, ..., proxy cache for to, obj], to: [RemoteProxy for obj]
-		lua_pushcfunction(from, new_proxy_finaliser);
+		pushcfunction_from_outside(to, from, new_proxy_finaliser);
 		lua_insert(from, -3);
 		lua_pushlightuserdata(from, rp);
 		remote_pcall(to, from, 3, 1);
@@ -474,7 +495,7 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 	} else {
 		if (DEBUG) fprintf(stderr, "create_proxy: Running in from state\n");
 		// We're in from, so need to pcall to.
-		lua_pushcfunction(to, new_remote_proxy);
+		pushcfunction_from_outside(from, to, new_remote_proxy);
 		lua_pushlightuserdata(to, from);
 		remote_pcall(from, to, 1, 1);
 		RemoteProxy *rp = lua_touserdata(to, -1);
@@ -549,7 +570,7 @@ static void transfer_index(lua_State *raise_errors_in, lua_State *to, lua_State 
 			copy_string_inner(to, from, idx);
 		} else {
 			lua_pushvalue(from, idx);
-			lua_pushcfunction(to, copy_string);
+			pushcfunction_from_outside(from, to, copy_string);
 			lua_pushlightuserdata(to, from);
 			remote_pcall(raise_errors_in, to, 1, 1);
 			lua_pop(from, 1);
