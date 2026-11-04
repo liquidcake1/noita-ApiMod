@@ -30,6 +30,7 @@ local val = dll.gettable()["simple_userdata"]()
 io.write("simple_userdata(): post!!!\n")
 io.write("simple_userdata(): ", tostring(val), "!!!\n")
 io.write("simple_userdata(): ", tostring(dll.gettable()["simple_userdata"]()), "!!!\n")
+dll.initialise();
 ffidll.increment();
 ffidll.increment();
 ffidll.increment();

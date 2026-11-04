@@ -1,3 +1,6 @@
 [submodule "native/luajit"]
 	path = native/luajit
 	url = https://github.com/LuaJIT/LuaJIT.git
+[submodule "native/minhook"]
+	path = native/minhook
+	url = https://github.com/TsudaKageyu/minhook.git
