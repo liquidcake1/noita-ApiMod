@@ -954,7 +954,7 @@ static const char *add_hook() {
 	// which we need here.
 	void *module_lua_newstate = GetProcAddress(lua, "lua_newstate");
 	void *module_luaL_newstate = GetProcAddress(lua, "luaL_newstate");
-	void *module_luaopen_math = GetProcAddress(lua, "luaopen_os");
+	void *module_luaopen_math = GetProcAddress(lua, "luaopen_math");
 	void *module_lua_close = GetProcAddress(lua, "lua_close");
 	if ((module_luaL_newstate == NULL) || (module_luaL_newstate == NULL) || (module_luaopen_math == NULL) || (module_lua_close == NULL)) {
 		return "Couldn't find C function to hook";
