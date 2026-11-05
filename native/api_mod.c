@@ -53,6 +53,8 @@ static lua_State *my_global;
  * * Hook lua_newstate (which we plan to do anyway -- it's the only way we're going to get data between states!).
  * * Have some jank requirement that you need to proxy an object in your main thread first.
  * * Have some super-jank thing where we keepalive the coroutine that created an object.
+ * TODO: We're not doing lua_checkstack properly and should make sure to do it in both states before we go on to append randomly to their stacks. LuaJit can call lj_state_growstack on _any_ append (even those not claiming a memory error can result!); any out-of-state append can therefore trigger a memory error and unwind the stack in a messed up way. The official Lua docs say this doesn't happen; that applications are responsible for managing the stack, but either way we can't overrun it.
+ * TODO double-check we're not pushing any objects onto states we don't own. These are anything other than lightuserdata, nil, integer and number. (pushvalue and insert are OK too, as are rawget, rawset of existing, ....)
  */
 
 // Left to do:
