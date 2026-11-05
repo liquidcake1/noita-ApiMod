@@ -1,10 +1,8 @@
 local ffi = require("ffi")
-ffi.cdef("void create(); void increment(); int get();")
-local ffidll = ffi.load("mods/ApiMod/api_mod.dll")
 local dll = package.loadlib("mods/ApiMod/api_mod.dll", "luaopen_api_mod")()
 local io = require("io")
 io.write("Loaded!!!\n")
-ffidll.create();
+dll.create()
 io.write("Created!!!\n")
 dll.settable("astring", "stringvalue")
 dll.settable("anint", 1)
@@ -23,6 +21,8 @@ io.write("abool: ", tostring(dll.gettable()["abool"]), "!!!\n")
 io.write("anil: ", tostring(dll.gettable()["anil"]), "!!!\n")
 io.write("atable: ", tostring(dll.gettable()["atable"]), "!!!\n")
 io.write("atable.foo: ", tostring(dll.gettable()["atable"].foo), "!!!\n")
+dll.gettable()["atable"].bar = 45
+io.write("atable.bar: ", tostring(dll.gettable()["atable"].bar), "!!!\n")
 io.write("afunction: ", tostring(dll.gettable()["afunction"]), "!!!\n")
 io.write("afunction(2): ", tostring(dll.gettable()["afunction"](2)), "!!!\n")
 io.write("simple_userdata(): pre!!!\n")
@@ -31,8 +31,3 @@ io.write("simple_userdata(): post!!!\n")
 io.write("simple_userdata(): ", tostring(val), "!!!\n")
 io.write("simple_userdata(): ", tostring(dll.gettable()["simple_userdata"]()), "!!!\n")
 dll.initialise();
-ffidll.increment();
-ffidll.increment();
-ffidll.increment();
-ffidll.increment();
-io.write("Output: ", ffidll.get(), "!!!\n")

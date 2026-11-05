@@ -1015,7 +1015,8 @@ static int initialise(lua_State *L) {
 	return 0;
 }
 
-static const luaL_Reg funcs[] = { {"settable", settable}, {"gettable", gettable}, {"initialise", initialise}, {NULL, NULL} };
+int create(lua_State* L);
+static const luaL_Reg funcs[] = { {"settable", settable}, {"gettable", gettable}, {"initialise", initialise}, {"create", create}, {NULL, NULL} };
 
 __declspec(dllexport) int luaopen_api_mod(lua_State *L) {
 	lua_newtable(L);
@@ -1064,23 +1065,12 @@ static int init_global(lua_State *global) {
 	return 0;
 }
 
-__declspec(dllexport) void create() {
+int create(lua_State* L) {
 	my_global = lua_newstate(l_alloc, NULL);
 	if (my_global == NULL) {
 		printf("Ooops!\n");
-		return;
+		return 0;
 	}
 	lua_cpcall(my_global, init_global, NULL);
-	lua_pushinteger(my_global, 0);
-}
-
-__declspec(dllexport) void increment() {
-	lua_Integer i = lua_tointeger(my_global, 1);
-	lua_pop(my_global, 1);
-	i += 1;
-	lua_pushinteger(my_global, i);
-}
-
-__declspec(dllexport) int get() {
-	return lua_tointeger(my_global, 1);
+	return 0;
 }
