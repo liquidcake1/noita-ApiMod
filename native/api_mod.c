@@ -855,7 +855,7 @@ static int remote_proxy__call(lua_State *to) {
 	return lua_gettop(to);
 }
 
-static int settable_inner(lua_State *global) {
+static int ApiMod_register_inner(lua_State *global) {
 	lua_pushstring(global, "foo");
 	lua_rawget(global, LUA_REGISTRYINDEX);
 	lua_insert(global, 1);
@@ -864,26 +864,26 @@ static int settable_inner(lua_State *global) {
 	return 0;
 }
 
-static int settable(lua_State *L) {
+static int ApiMod_register(lua_State *L) {
 	luaL_checkany(L, 2);
 	lua_settop(L, 2);
 	lua_checkstack(L, 1);
-	lua_pushlightuserdata(L, settable_inner);
+	lua_pushlightuserdata(L, ApiMod_register_inner);
 	lua_insert(L, 1);
 	pcall_transfer(L, my_global, 2, 0);
 	return 0;
 }
 
-static int gettable_inner(lua_State *global) {
+static int ApiMod_get_inner(lua_State *global) {
 	lua_pushstring(global, "foo");
 	lua_rawget(global, LUA_REGISTRYINDEX);
 	return 1;
 }
 
-static int gettable(lua_State *L) {
+static int ApiMod_get(lua_State *L) {
 	lua_settop(L, 0);
-	lua_pushlightuserdata(L, gettable_inner);
-	if (DEBUG) printf("About to call gettable!\n");
+	lua_pushlightuserdata(L, ApiMod_get_inner);
+	if (DEBUG) printf("About to call ApiMod_get!\n");
 	pcall_transfer(L, my_global, 0, 1);
 	return 1;
 }
@@ -915,6 +915,8 @@ static const char *pin_ourself() {
 	return NULL;
 }
 
+static const luaL_Reg ApiMod_funcs[] = { {"register", ApiMod_register}, {"get", ApiMod_get}, {NULL, NULL} };
+
 static int states = 0;
 
 static lua_State* (*orig_lua_newstate)(lua_Alloc,void*) = NULL;
@@ -924,6 +926,7 @@ static int (*orig_lua_close)(lua_State*) = NULL;
 lua_State *our_lua_newstate(lua_Alloc f, void *ud) {
 	lua_State *L = orig_lua_newstate(f, ud);
 	fprintf(stderr, "lua_newstate called -> %lx (%i)!\n", (long)L, ++states);
+	luaL_register(L, "ApiMod", ApiMod_funcs);
 	return L;
 }
 lua_State *our_luaL_newstate() {
@@ -1018,23 +1021,14 @@ static int initialise(lua_State *L) {
 }
 
 int create(lua_State* L);
-static const luaL_Reg funcs[] = { {"settable", settable}, {"gettable", gettable}, {"initialise", initialise}, {"create", create}, {NULL, NULL} };
+static const luaL_Reg funcs[] = { {"initialise", initialise}, {"create", create}, {NULL, NULL} };
 
 __declspec(dllexport) int luaopen_api_mod(lua_State *L) {
+	luaL_register(L, "ApiMod", ApiMod_funcs);
+	lua_pop(L, 1);
 	lua_newtable(L);
 	luaL_register(L, NULL, funcs);
 	return 1;
-}
-
-// Example allocator from lua docs
-static void *l_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
-	(void)ud;  (void)osize;  /* not used */
-	if (nsize == 0) {
-		free(ptr);
-		return NULL;
-	} else {
-		return realloc(ptr, nsize);
-	}
 }
 
 static int simple_call(lua_State *global) {
@@ -1068,7 +1062,7 @@ static int init_global(lua_State *global) {
 }
 
 int create(lua_State* L) {
-	my_global = lua_newstate(l_alloc, NULL);
+	my_global = luaL_newstate();
 	if (my_global == NULL) {
 		printf("Ooops!\n");
 		return 0;
