@@ -7,8 +7,6 @@
 #include <MinHook.h>
 #include <windows.h>
 
-static lua_State *my_global;
-
 #define DEBUG 0
 
 // TODO can we avoid this?
@@ -664,7 +662,7 @@ static void transfer_index(lua_State *raise_errors_in, lua_State *to, lua_State 
 			break;
 		}
 		lua_pop(from, 2);
-		if (DEBUG) fprintf(stderr, "Transferring a proxy %lx from %lx to %lx.\n", (long)lua_touserdata(from, idx), (long)from, (long)to);
+		if (DEBUG) fprintf(stderr, "Transferring a proxy %lx (%i type %i) from %lx to %lx.\n", (long)lua_touserdata(from, idx), idx, lua_type(from, idx), (long)from, (long)to);
 		RemoteProxy *rp = (RemoteProxy*)lua_touserdata(from, idx);
 		if (rp->dead) {
 			if (DEBUG) fprintf(stderr, "It's dead.\n");
@@ -748,7 +746,7 @@ static int pcall_transfer_internal(lua_State *call_in) {
 
 	// Pop everything we just transfered or copied.
 	lua_pop(call_data_from, nargs + 1);
-	size_t old_top = lua_gettop(call_data_from) - nargs;
+	size_t old_top = lua_gettop(call_in) - nargs - 1;
 	// call_in: [func as cfunction, arg1, ..., argn]; call_data_from: []
 
 	if (DEBUG) fprintf(stderr, "pcall_transfer_internal: Call!\n");
@@ -758,7 +756,7 @@ static int pcall_transfer_internal(lua_State *call_in) {
 	// We already checked call_data_from has the stack space in lua_cpcall_transfer.
 	int stop;
 	if (nret == LUA_MULTRET) {
-		stop = lua_gettop(call_data_from);
+		stop = lua_gettop(call_in);
 		if (stop - old_top > MAXMULTRET) {
 			stop = old_top + MAXMULTRET;
 		}
@@ -855,37 +853,90 @@ static int remote_proxy__call(lua_State *to) {
 	return lua_gettop(to);
 }
 
+
+/**
+ * ApiMod_registry_state is used to hold the mod registry, out of the ApiMod
+ * initialisation module itself (which has no direct access). There's nothing
+ * in here but a K/V table of name -> proxy.
+ *
+ * We hold proxies in a table named by APIMOD_REGISTRY_KEY in the registry
+ * of this state, and register/get will proxy here to set/get values.
+ *
+ * Because tables are read-only proxies, we could also directly return the
+ * table as a proxy ("get_all()"), but that seems more complex (among other
+ * things, there doesn't seem to be a natural way to proxy iteration via
+ * metatables, so the only actual operation would be a metatable lookup, which
+ * is just get() anyway).
+ */
+static lua_State *ApiMod_registry_state;
+static int APIMOD_REGISTRY_KEY; // Unused, just used as a registry key.
+
 static int ApiMod_register_inner(lua_State *global) {
-	lua_pushstring(global, "foo");
+	lua_pushlightuserdata(global, &APIMOD_REGISTRY_KEY);
 	lua_rawget(global, LUA_REGISTRYINDEX);
 	lua_insert(global, 1);
 	lua_rawset(global, 1);
-	lua_pop(global, 1);
+	lua_remove(global, 1);
 	return 0;
 }
 
 static int ApiMod_register(lua_State *L) {
+	if (ApiMod_registry_state == NULL) {
+		lua_pushstring(L, "ApiMod_register: ApiMod is not initialised yet.");
+		lua_error(L);
+	}
+	luaL_checkstring(L, 1);
 	luaL_checkany(L, 2);
 	lua_settop(L, 2);
 	lua_checkstack(L, 1);
 	lua_pushlightuserdata(L, ApiMod_register_inner);
 	lua_insert(L, 1);
-	pcall_transfer(L, my_global, 2, 0);
+	pcall_transfer(L, ApiMod_registry_state, 2, 0);
 	return 0;
 }
 
 static int ApiMod_get_inner(lua_State *global) {
-	lua_pushstring(global, "foo");
+	lua_pushlightuserdata(global, &APIMOD_REGISTRY_KEY);
 	lua_rawget(global, LUA_REGISTRYINDEX);
+	lua_insert(global, 1);
+	lua_rawget(global, 1);
+	lua_remove(global, 1);
 	return 1;
 }
 
 static int ApiMod_get(lua_State *L) {
-	lua_settop(L, 0);
+	if (ApiMod_registry_state == NULL) {
+		lua_pushstring(L, "ApiMod_get: ApiMod is not initialised yet.");
+		lua_error(L);
+	}
+	luaL_checkstring(L, 1);
+	lua_settop(L, 1);
 	lua_pushlightuserdata(L, ApiMod_get_inner);
-	if (DEBUG) printf("About to call ApiMod_get!\n");
-	pcall_transfer(L, my_global, 0, 1);
+	lua_insert(L, 1);
+	if (DEBUG) fprintf(stderr, "About to call ApiMod_get!\n");
+	pcall_transfer(L, ApiMod_registry_state, 1, 1);
 	return 1;
+}
+
+static int init_ApiMod_registry(lua_State *global) {
+	lua_checkstack(global, 2);
+	lua_pushlightuserdata(global, &APIMOD_REGISTRY_KEY);
+	lua_newtable(global);
+	lua_rawset(global, LUA_REGISTRYINDEX);
+	return 0;
+}
+
+void create_registry(lua_State* L) {
+	if (ApiMod_registry_state != NULL) {
+		lua_pushstring(L, "ApiMod registry is already created");
+		lua_error(L);
+	}
+	ApiMod_registry_state = luaL_newstate();
+	if (ApiMod_registry_state == NULL) {
+		lua_pushstring(L, "Could not create ApiMod registry");
+		lua_error(L);
+	}
+	lua_cpcall(ApiMod_registry_state, init_ApiMod_registry, NULL);
 }
 
 static void handle_charstar_error(lua_State *L, const char *where, const char *error) {
@@ -978,10 +1029,10 @@ static const char *add_hook() {
 }
 
 static int cleanup(lua_State *L) {
-	if (my_global != NULL) {
+	if (ApiMod_registry_state != NULL) {
 		if (DEBUG) fprintf(stderr, "cleanup in %lx\n", (long)L);
-		lua_close(my_global);
-		my_global = NULL;
+		lua_close(ApiMod_registry_state);
+		ApiMod_registry_state = NULL;
 		if (DEBUG) fprintf(stderr, "cleanup done %lx\n", (long)L);
 		return 0;
 	}
@@ -1008,20 +1059,15 @@ static void make_finaliser(lua_State *L) {
 //static int INITIALISED_KEY; // Never observed; just used as a key in the initialising state's registry.
 //static lua_State *main_state = NULL;
 static int initialise(lua_State *L) {
-	fprintf(stderr, "initialise 1\n");
+	create_registry(L);
 	handle_charstar_error(L, "initialise", ensure_not_called_again());
-	fprintf(stderr, "initialise 2\n");
 	make_finaliser(L);
-	fprintf(stderr, "initialise 3\n");
 	handle_charstar_error(L, "pin_ourself", pin_ourself());
-	fprintf(stderr, "initialise 4\n");
 	handle_charstar_error(L, "add_hook", add_hook());
-	fprintf(stderr, "initialise 5\n");
 	return 0;
 }
 
-int create(lua_State* L);
-static const luaL_Reg funcs[] = { {"initialise", initialise}, {"create", create}, {NULL, NULL} };
+static const luaL_Reg funcs[] = { {"initialise", initialise}, {NULL, NULL} };
 
 __declspec(dllexport) int luaopen_api_mod(lua_State *L) {
 	luaL_register(L, "ApiMod", ApiMod_funcs);
@@ -1029,44 +1075,4 @@ __declspec(dllexport) int luaopen_api_mod(lua_State *L) {
 	lua_newtable(L);
 	luaL_register(L, NULL, funcs);
 	return 1;
-}
-
-static int simple_call(lua_State *global) {
-	int *ud = (int*)lua_touserdata(global, 1);
-	*ud += 1;
-	lua_pushinteger(global, *ud);
-	return 1;
-}
-
-static void make_simple_userdata(lua_State *global) {
-	int *ud = (int*)lua_newuserdata(global, sizeof(int));
-	*ud = 10;
-	lua_newtable(global);
-	lua_pushstring(global, "__call");
-	lua_pushcfunction(global, simple_call);
-	lua_rawset(global, -3);
-	lua_setmetatable(global, -2);
-}
-
-static int init_global(lua_State *global) {
-	lua_checkstack(global, 2);
-	lua_pushstring(global, "foo");
-	lua_newtable(global);
-
-	lua_pushstring(global, "simple_userdata");
-	make_simple_userdata(global);
-	lua_rawset(global, -3);
-
-	lua_rawset(global, LUA_REGISTRYINDEX);
-	return 0;
-}
-
-int create(lua_State* L) {
-	my_global = luaL_newstate();
-	if (my_global == NULL) {
-		printf("Ooops!\n");
-		return 0;
-	}
-	lua_cpcall(my_global, init_global, NULL);
-	return 0;
 }
