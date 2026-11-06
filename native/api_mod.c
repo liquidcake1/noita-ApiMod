@@ -43,7 +43,7 @@
  *   * Functions become RemoteProxy.
  *   * RemoteProxy userdata becomes the real object (if sent to owner state) or a RemoteProxy in the dest (otherwise).
  *   * Other userdata is proxied, but still only supports __index and __call.
- *   * You can't copy a lightuserdata (TODO we allow this; I don't think we need it -- we do use lud in calls, but only for known positional args).
+ *   * You can't copy a lightuserdata.
  *   * You can't copy a thread.
  *
  * TODO: We need to resolve threads to their owning state, as a proxy created by a thread will bear reference to the thread, which can get garbage collected and leave us hanging.
