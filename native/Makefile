@@ -12,7 +12,7 @@ lua51.a: lua51.def
 	$(DLLTOOL) --dllname lua51.dll --input-def lua51.def --output-lib lua51.a
 
 api_mod.dll: lua51.a api_mod.c Makefile
-	$(CC) $(BUILD_OPTS) -Iluajit/src -Iminhook/include -o api_mod.dll api_mod.c minhook/src/*.c minhook/src/hde/hde32.c lua51.a
+	$(CC) $(BUILD_OPTS) -Iluajit/src -Iminhook/include -o api_mod.dll *.c minhook/src/*.c minhook/src/hde/hde32.c lua51.a
 
 .PHONY:
 clean: .PHONY
