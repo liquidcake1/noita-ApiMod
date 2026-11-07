@@ -46,12 +46,24 @@
  *   * You can't copy a lightuserdata.
  *   * You can't copy a thread.
  *
- * TODO: We need to resolve threads to their owning state, as a proxy created by a thread will bear reference to the thread, which can get garbage collected and leave us hanging.
- * There are three fixes:
- * * Hook lua_newstate (which we plan to do anyway -- it's the only way we're going to get data between states!).
- * * Have some jank requirement that you need to proxy an object in your main thread first.
- * * Have some super-jank thing where we keepalive the coroutine that created an object.
- * TODO: We're not doing lua_checkstack properly and should make sure to do it in both states before we go on to append randomly to their stacks. LuaJit can call lj_state_growstack on _any_ append (even those not claiming a memory error can result!); any out-of-state append can therefore trigger a memory error and unwind the stack in a messed up way. The official Lua docs say this doesn't happen; that applications are responsible for managing the stack, but either way we can't overrun it.
+ * Thread wrangling:
+ * * If a proxy is created, we look up the main thread and record that in the
+ *   state of the owner as the target. This means if the thread then passes the
+ *   data elsewhere, when the garbage collector runs in the main thread, it can
+ *   pass something that still exists to the owner to help its cleanup.
+ * * Similarly, the RemoteProxy records the _main_ thread of the owner, so that
+ *   if the owner created a proxy in a return value, we hold a valid pointer to
+ *   the owning state. This probably isn't actually needed, as this can only
+ *   happen when proxying a call into the state (which by construction of the
+ *   proxy will only happen on the main thread anyway).
+ * * A weird behaviour is that if we switch state and then call, returned calls
+ *   are in the main thread again. If we called into the "known current thread",
+ *   we'd have access to the _thread_ environment. It's also a bit naughty because
+ *   B "believes" it's in two calls (the stack will be a bit odd; it'll see
+ *   nothing inside the coroutine). We should probably record the "current" thread
+ *   and call into that with remote calls. TODO.
+ *
+ * TODO: We're not doing lua_checkstack properly and should make sure to do it in both states before we go on to append randomly to their stacks. LuaJit (master: TODO?) can call lj_state_growstack on _any_ append (even those not claiming a memory error can result!); any out-of-state append can therefore trigger a memory error and unwind the stack in a messed up way. The official Lua docs say this doesn't happen; that applications are responsible for managing the stack, but either way we can't overrun it.
  * TODO double-check we're not pushing any objects onto states we don't own. These are anything other than lightuserdata, nil, integer and number. (pushvalue and insert are OK too, as are rawget, rawset of existing, ....)
  */
 
@@ -60,6 +72,7 @@
 // For metatables, can "name" types using luaL_newmetatable. It seems like a PITA to make sure there's no collision, though?
 
 static int TMP_KEY; // Unique address to passaround return values using lua_cpcall.
+static int MAIN_THREAD_KEY; // Registry key to store the main thread of a lua_State*.
 
 // userdata held in a "remote" lua_State to facilitate proxy calls
 static int REMOTE_PROXY_METATABLE_KEY; // Unique address to use as index. Value irrelevant.
@@ -323,8 +336,8 @@ static int setup_outgoing_proxy_cache_for(lua_State *from) {
 // before: from: [] + 3
 // after: from: [proxy cache for to]
 // We're running in raise_errors_in, but have "some" stack leeway in from (TODO), and raising here will clear from's state.
-static void ensure_outgoing_proxy_cache_for(lua_State *raise_errors_in, lua_State *from, lua_State *to) {
-	lua_pushlightuserdata(from, to);
+static void ensure_outgoing_proxy_cache_for(lua_State *raise_errors_in, lua_State *from, lua_State *to_main) {
+	lua_pushlightuserdata(from, to_main);
 	lua_rawget(from, LUA_REGISTRYINDEX);
 	// from: [proxy cache for to or nil]
 	if (!lua_isnil(from, -1)) {
@@ -333,14 +346,14 @@ static void ensure_outgoing_proxy_cache_for(lua_State *raise_errors_in, lua_Stat
 	// First outgoing proxy to to, so make a table.
 	lua_pop(from, 1); // pop the nil
 	if (raise_errors_in == from) {
-		setup_outgoing_proxy_cache_for_inner(from, to);
+		setup_outgoing_proxy_cache_for_inner(from, to_main);
 		// from: [proxy cache for to]
 	} else {
 		if (DEBUG) fprintf(stderr, "ensure_outgoing_proxy_cache_for: pushcfunction_from_outside\n");
-		pushcfunction_from_outside(to, from, setup_outgoing_proxy_cache_for);
-		lua_pushlightuserdata(from, to);
+		pushcfunction_from_outside(raise_errors_in, from, setup_outgoing_proxy_cache_for);
+		lua_pushlightuserdata(from, to_main);
 		if (DEBUG) fprintf(stderr, "ensure_outgoing_proxy_cache_for: remote_pcall\n");
-		remote_pcall(to, from, 1, 1);
+		remote_pcall(raise_errors_in, from, 1, 1);
 		// from: [proxy cache for to]
 	}
 }
@@ -411,6 +424,24 @@ void ensure_weak_remote_proxy_lookup(lua_State *to) {
 	}
 }
 
+lua_State *get_main_thread(lua_State *raise_errors_in, lua_State *L) {
+	lua_State *main;
+	if (lua_pushthread(L)) {
+		lua_pop(L, 1);
+		return L;
+	} else {
+		lua_pushlightuserdata(L, &MAIN_THREAD_KEY);
+		lua_rawget(L, LUA_REGISTRYINDEX);
+		main = lua_tothread(L, -1);
+		lua_pop(L, 2);
+		if (main == NULL) {
+			lua_pushstring(raise_errors_in, "get_main_thread: MAIN_THREAD_KEY does not exist in registry");
+			lua_error(raise_errors_in);
+		}
+		return main;
+	}
+}
+
 // In the state of to, make a userdata RemoteProxy which points at from, and leave it at the top of the stack.
 // Before: to: [...]
 // After: to: [..., RemoteProxy]
@@ -423,7 +454,7 @@ static RemoteProxy *new_remote_proxy_inner(lua_State *to, lua_State *from) {
 		lua_error(to);
 	}
 	rp->dead = true;
-	rp->owner = from;
+	rp->owner = get_main_thread(to, from);
 	ensure_remote_proxy_metatable(to);
 	lua_setmetatable(to, -2);
 	// to: [..., RemoteProxy], from: []
@@ -454,7 +485,7 @@ static int new_remote_proxy(lua_State *to) {
 
 // In the state of from, make a userdata ProxyFinaliser which points at to's RemoteProxy.
 // We don't return it, it's needed only to GC.
-// Before: from: [..., proxy cache for to, obj, RemoteProxy*] + 4
+// Before: from: [..., proxy cache for to_main, obj, RemoteProxy*] + 4
 // After: from: [..., ProxyFinaliser]
 static ProxyFinaliser *new_proxy_finaliser_inner(lua_State *from) {
 	RemoteProxy *rp = (RemoteProxy*)lua_touserdata(from, -1);
@@ -469,18 +500,18 @@ static ProxyFinaliser *new_proxy_finaliser_inner(lua_State *from) {
 	pf->other = rp;
 	ensure_proxy_finaliser_metatable(from); // Needs 3 space
 	lua_setmetatable(from, -2);
-	// from: [proxy cache for to, obj, pf]
+	// from: [proxy cache for to_main, obj, pf]
 	lua_pushlightuserdata(from, rp);
 	lua_pushvalue(from, -3);
 	if (DEBUG) fprintf(stderr, "new_proxy_finaliser_inner: Setting up from:registry[%lx] to type %i\n", (long)rp, lua_type(from, -1));
 	lua_rawset(from, LUA_REGISTRYINDEX); // from:registry[&rp] = obj // TODO defer this? A crash after will leak obj forever...
-	// from: [proxy cache for to, obj, pf]
+	// from: [proxy cache for to_main, obj, pf]
 	lua_pushvalue(from, -1);
 	lua_insert(from, -4);
-	// from: [pf, proxy cache for to, obj, pf]
+	// from: [pf, proxy cache for to_main, obj, pf]
 	if (DEBUG) fprintf(stderr, "new_proxy_finaliser_inner: Pointing proxy cache for caller for obj to %lx (which hopefully is %lx)\n", (long)lua_touserdata(from, -1), (long)pf);
-	lua_rawset(from, -3); // from:registry[to][obj] = pf // TODO similarly, this will also leak obj and pf if we crash...
-	// from: [pf, proxy cache for to]
+	lua_rawset(from, -3); // from:registry[to_main][obj] = pf // TODO similarly, this will also leak obj and pf if we crash...
+	// from: [pf, proxy cache for to_main]
 	lua_pop(from, 1);
 	return pf;
 }
@@ -503,11 +534,11 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 		idx = lua_gettop(from) + 1 + idx;
 	}
 	// from: [obj, ...], to: []
-	ensure_outgoing_proxy_cache_for(raise_errors_in, from, to);
-	// from: [obj, ..., proxy cache for to]; to: []
+	ensure_outgoing_proxy_cache_for(raise_errors_in, from, get_main_thread(raise_errors_in, to));
+	// from: [obj, ..., proxy cache for to_main]; to: []
 	lua_pushvalue(from, idx);
 	lua_rawget(from, -2);
-	// from: [obj, ..., proxy_cache for to, ProxyFinaliser for obj or nil], to: []
+	// from: [obj, ..., proxy_cache for to_main, ProxyFinaliser for obj or nil], to: []
 	if (!lua_isnil(from, -1)) {
 		if (DEBUG) fprintf(stderr, "create_proxy: Found a cache %lx!\n", (long)lua_touserdata(from, -1));
 		// from: [obj, ..., proxy_cache for to, ProxyFinaliser for obj], to: []
@@ -533,14 +564,14 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 	}
 
 	lua_pop(from, 1);
-	// from: [obj, ..., proxy cache for to], to: []
+	// from: [obj, ..., proxy cache for to_main], to: []
 	// We don't have a proxy for this object.
 	// First, get a RemoteProxy in *to
 	if (raise_errors_in == to) {
 		if (DEBUG) fprintf(stderr, "create_proxy: Running in to state\n");
 		lua_pushvalue(from, idx);
 		RemoteProxy *rp = new_remote_proxy_inner(to, from);
-		// from: [obj, ..., proxy cache for to, obj], to: [RemoteProxy for obj]
+		// from: [obj, ..., proxy cache for to_main, obj], to: [RemoteProxy for obj]
 		if (DEBUG) fprintf(stderr, "create_proxy: pushcfunction_from_outside\n");
 		pushcfunction_from_outside(to, from, new_proxy_finaliser);
 		lua_insert(from, -3);
@@ -565,7 +596,7 @@ static void create_proxy(lua_State *raise_errors_in, lua_State *to, lua_State *f
 		if (DEBUG) fprintf(stderr, "create_proxy: rp is %lx, type is %i\n", (long)rp, lua_type(to, -1));
 		lua_pushvalue(from, idx);
 		lua_pushlightuserdata(from, rp);
-		// from: [obj, ..., proxy_cache for to, obj, RemoteProxy* for obj], to: [RemoteProxy for obj]
+		// from: [obj, ..., proxy_cache for to_main, obj, RemoteProxy* for obj], to: [RemoteProxy for obj]
 
 		ProxyFinaliser* pf = new_proxy_finaliser_inner(from);
 		lua_pop(from, 1);
@@ -977,6 +1008,9 @@ static int (*orig_lua_close)(lua_State*) = NULL;
 lua_State *our_lua_newstate(lua_Alloc f, void *ud) {
 	lua_State *L = orig_lua_newstate(f, ud);
 	fprintf(stderr, "lua_newstate called -> %lx (%i)!\n", (long)L, ++states);
+	lua_pushlightuserdata(L, &MAIN_THREAD_KEY);
+	lua_pushthread(L);
+	lua_rawset(L, LUA_REGISTRYINDEX);
 	luaL_register(L, "ApiMod", ApiMod_funcs);
 	return L;
 }
