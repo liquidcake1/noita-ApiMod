@@ -11,7 +11,7 @@
  *   In the caller state, a RemoteProxy rp. It's exposed to Lua and has a metatable to allow calls through to owner.
  *
  * Wiring (& = lightuserdata, plain = real userdata or plain object):
- *   owner:registry[&rp] = original        // Acts as a keepalive for original, and lookup to resolve rp
+ *   owner:registry[&pf] = original        // Acts as a keepalive for original, and lookup to resolve rp
  *   owner:registry[caller][original] = pf // Acts as keepalive for pf and cache for re-proxying (pf has pointer to rp).
  *   caller:registry:cache                 // This (REMOTE_PROXY_LOOKUP_KEY) is a weak _value_ table, so that we can gc when the last reference goes away.
  *   caller:registry:cache[&rp] = rp       // To allow owner to resolve a cached &rp to the real userdata.
@@ -86,7 +86,7 @@ static int ApiMod_register_inner(lua_State *global) {
 	lua_rawget(global, LUA_REGISTRYINDEX);
 	lua_insert(global, 1);
 	lua_rawset(global, 1);
-	lua_remove(global, 1);
+	lua_pop(global, 1);
 	return 0;
 }
 
@@ -98,10 +98,7 @@ static int ApiMod_register(lua_State *L) {
 	luaL_checkstring(L, 1);
 	luaL_checkany(L, 2);
 	lua_settop(L, 2);
-	lua_checkstack(L, 1);
-	lua_pushlightuserdata(L, ApiMod_register_inner);
-	lua_insert(L, 1);
-	pcall_transfer(L, ApiMod_registry_state, 2, 0);
+	pcall_transfer(L, ApiMod_registry_state, ApiMod_register_inner, 2, 0);
 	return 0;
 }
 
@@ -121,10 +118,8 @@ static int ApiMod_get(lua_State *L) {
 	}
 	luaL_checkstring(L, 1);
 	lua_settop(L, 1);
-	lua_pushlightuserdata(L, ApiMod_get_inner);
-	lua_insert(L, 1);
 	if (DEBUG) fprintf(stderr, "About to call ApiMod_get!\n");
-	pcall_transfer(L, ApiMod_registry_state, 1, 1);
+	pcall_transfer(L, ApiMod_registry_state, ApiMod_get_inner, 1, 1);
 	return 1;
 }
 

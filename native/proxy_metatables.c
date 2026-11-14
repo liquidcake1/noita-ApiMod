@@ -22,11 +22,9 @@ static void remote_proxy_inner(lua_State *to, lua_CFunction func, int nargs, int
 	RemoteProxy *rp = check_remote_proxy(to, to, 1);
 
 	lua_checkstack(to, 1);
-	lua_pushlightuserdata(to, func);
-	lua_insert(to, 1);
 	// [remote_proxy__?_inner, rp for obj, arg1, ..., argn]
 
-	pcall_transfer(to, rp->owner, nargs, nret);
+	pcall_transfer(to, rp->owner, func, nargs, nret);
 }
 
 // In "from", we're doing table[key] for a table proxied from "to". Proxying is handled by pcall_transfer.

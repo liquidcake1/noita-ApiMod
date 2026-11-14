@@ -16,11 +16,11 @@ int proxy_finaliser__gc(lua_State *from) {
 	ProxyFinaliser *pf = (ProxyFinaliser *)check_userdata(from, from, -1, &PROXY_FINALISER_METATABLE_KEY);
 	// Congrats, pf _is_ a ProxyFinaliser!
 	if (pf->dead) {
-		if (DEBUG) fprintf(stderr, "proxy_finaliser__gc: %lx for %lx is dead\n", (long)pf, (long)pf->other);
+		if (DEBUG) fprintf(stderr, "proxy_finaliser__gc: %lx for %lx is dead\n", (long)pf, (long)pf->proxy);
 		return 0;
 	}
-	if (DEBUG) fprintf(stderr, "proxy_finaliser__gc: %lx for %lx lives!\n", (long)pf, (long)pf->other);
-	pf->other->dead = true;
+	if (DEBUG) fprintf(stderr, "proxy_finaliser__gc: %lx for %lx lives!\n", (long)pf, (long)pf->proxy);
+	pf->proxy->dead = true;
 	return 0;
 }
 
@@ -35,17 +35,18 @@ static int remote_proxy__gc_from(lua_State *from) {
 	RemoteProxy *rp = (RemoteProxy*)lua_touserdata(to, 1);
 	// We're just going to trust this one is wired right.
 	lua_checkstack(from, 4);
-	lua_pushlightuserdata(from, rp);
+	lua_pushlightuserdata(from, rp->finaliser);
 	lua_rawget(from, LUA_REGISTRYINDEX);
 	// from: [obj]
+	if (DEBUG) fprintf(stderr, "remote_proxy__gc_from: type of object is %i\n", lua_type(from, -1));
 	if (lua_isnil(from, -1)) {
 		fprintf(stderr, "RemoteProxy lookup failed for %lx in %lx...\n", (long)to, (long)from);
 		lua_pushstring(from, "RemoteProxy lookup failed");
 		lua_error(from);
 	}
-	lua_pushlightuserdata(from, rp);
+	lua_pushlightuserdata(from, rp->finaliser);
 	lua_pushnil(from);
-	lua_rawset(from, LUA_REGISTRYINDEX); // Delete from:registry[&rp]
+	lua_rawset(from, LUA_REGISTRYINDEX); // Delete from:registry[&pf]
 	// from: [obj]
 	lua_pushlightuserdata(from, to);
 	lua_rawget(from, LUA_REGISTRYINDEX);

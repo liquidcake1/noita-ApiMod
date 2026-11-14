@@ -70,28 +70,7 @@ void handle_error_from(lua_State *raise_to, lua_State *ran_in, int retval) {
 	}
 }
 
-static int TMP_KEY; // Unique address to passaround return values using lua_cpcall.
-
-// Reinterpret userdata as cfunction and put it in TMP_KEY.
-static int pushcfunction_inner(lua_State *L) {
-	lua_CFunction func = (lua_CFunction)lua_touserdata(L, 1);
-	lua_pop(L, 1);
-	lua_pushlightuserdata(L, &TMP_KEY);
-	lua_pushcfunction(L, func);
-	lua_rawset(L, LUA_REGISTRYINDEX);
-	return 0;
-}
-
-// Get a lua_cfunction safely onto the stack of L, or raise in raise_errors_in
-// Bit of a hack, but it's "safe" in the sense that it cannot error locally.
-// Needs 1 stack in L, though lua_cpcall probably guarantees that.
-void pushcfunction_from_outside(lua_State *raise_errors_in, lua_State *L, lua_CFunction func) {
-	if (DEBUG) fprintf(stderr, "pushcfunction_from_outside\n");
-	handle_error_from(raise_errors_in, L, lua_cpcall(L, pushcfunction_inner, func));
-	lua_pushlightuserdata(L, &TMP_KEY);
-	lua_rawget(L, LUA_REGISTRYINDEX);
-}
-
+int RETURN_TMP_KEY; // Unique address to passaround return values using lua_cpcall.
 
 // cpcall func in call_in with call_from as param, re-raising errors in call_from.
 void remote_cpcall(lua_State *call_from, lua_State *call_in, lua_CFunction func) {
@@ -104,9 +83,15 @@ void remote_pcall(lua_State *raise_errors_in, lua_State *call, int nargs, int nr
 	handle_error_from(raise_errors_in, call, lua_pcall(call, nargs, nresults, 0));
 }
 
+static int get_main_thread_pcall(lua_State*);
+
 static int MAIN_THREAD_KEY; // Registry key to store the main thread of a lua_State*.
 lua_State *get_main_thread(lua_State *raise_errors_in, lua_State *L) {
 	lua_State *main;
+	if (raise_errors_in != L) {
+		handle_error_from(raise_errors_in, L, lua_cpcall(L, get_main_thread_pcall, &main));
+		return main;
+	}
 	if (lua_pushthread(L)) {
 		lua_pop(L, 1);
 		return L;
@@ -121,6 +106,12 @@ lua_State *get_main_thread(lua_State *raise_errors_in, lua_State *L) {
 		}
 		return main;
 	}
+}
+
+static int get_main_thread_pcall(lua_State *L) {
+	lua_State **main = lua_touserdata(L, 1);
+	*main = get_main_thread(L, L);
+	return 0;
 }
 
 void set_main_thread(lua_State *L) {
