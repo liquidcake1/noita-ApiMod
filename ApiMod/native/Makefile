@@ -11,7 +11,7 @@ DLLTOOL=i686-w64-mingw32-dlltool
 SOURCES=api_mod.c destroy_proxy.c hooks.c proxy.c proxy_metatables.c transfer.c util.c
 EXT_SOURCES=minhook/src/buffer.c minhook/src/hook.c minhook/src/trampoline.c minhook/src/hde/hde32.c
 
-all: api_mod.dll
+all: dbroot/build/api_mod.dll
 
 lua51.a: lua51.def
 	$(DLLTOOL) --dllname lua51.dll --input-def lua51.def --output-lib lua51.a
@@ -27,9 +27,8 @@ clean: .PHONY
 # Needs: apt install fakechroot fakeroot debootstrap
 dbroot:
 	fakechroot fakeroot debootstrap trixie dbroot https://snapshot.debian.org/archive/debian/20261116T000000Z/
-	fakechroot fakeroot chroot dbroot apt install -yy binutils-mingw-w64-i686 g++-mingw-w64-i686-win32 make
+	fakechroot fakeroot chroot dbroot apt install -yy binutils-mingw-w64-i686 gcc-mingw-w64-i686-win32 make
 
-build_reproducible: dbroot
+dbroot/build/api_mod.dll: dbroot $(SOURCES) $(EXT_SOURCES)
 	rsync --delete --delete-excluded --exclude=.git -a *.[ch] lua51.def Makefile luajit minhook dbroot/build
 	fakechroot fakeroot chroot dbroot bash -c 'cd /build && make api_mod.dll'
-	cp dbroot/build/api_mod.dll .

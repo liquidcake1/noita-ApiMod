@@ -1,8 +1,18 @@
-build_native:
-	$(MAKE) -C native
-install: build_native
-	mkdir -p Noita/mods/ApiMod
-	cp -a native/api_mod.dll mod/init.lua mod/mod.xml Noita/mods/ApiMod
+.PHONY:
+package: .PHONY
+	$(MAKE) -C ApiMod package
+	$(MAKE) -C ApiMod-pollnet package
+
+# Refresh the sha256sums so that package can run
+.PHONY:
+sha256sums: .PHONY
+	$(MAKE) -C ApiMod sha256sums
+	$(MAKE) -C ApiMod-pollnet sha256sums
+
+install: package
+	rsync --delete -a ApiMod/package/* Noita/mods/ApiMod/
+	rsync --delete -a ApiMod-pollnet/package/* Noita/mods/ApiMod-pollnet/
+
 run: install
 	cd Noita; env WINEPREFIX=$(CURDIR)/wineprefix wine noita.exe
 run_dev: install

@@ -1,6 +1,9 @@
-[submodule "native/luajit"]
-	path = native/luajit
+[submodule "ApiMod/native/luajit"]
+	path = ApiMod/native/luajit
 	url = https://github.com/LuaJIT/LuaJIT.git
-[submodule "native/minhook"]
-	path = native/minhook
+[submodule "ApiMod/native/minhook"]
+	path = ApiMod/native/minhook
 	url = https://github.com/TsudaKageyu/minhook.git
+[submodule "ApiMod-pollnet/pollnet"]
+	path = ApiMod-pollnet/pollnet
+	url = https://github.com/probable-basilisk/pollnet
