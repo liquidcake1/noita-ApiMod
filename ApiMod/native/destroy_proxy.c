@@ -24,15 +24,20 @@ int proxy_finaliser__gc(lua_State *from) {
 	return 0;
 }
 
+typedef struct GcRequest {
+	lua_State *remote;
+	lua_State *remote_main;
+} GcRequest;
+
 static int remote_proxy__gc_from(lua_State *from) {
-	lua_State *to = (lua_State*)lua_touserdata(from, 1);
-	if (to == NULL) {
+	GcRequest *gc_request = (GcRequest*)lua_touserdata(from, 1);
+	if (gc_request == NULL) {
 		if (DEBUG) fprintf(stderr, "Lua error raising: remote_proxy__gc_from: Param must be lua_State*\n");
 		lua_pushstring(from, "remote_proxy__gc_from: Param must be lua_State*");
 		lua_error(from);
 	}
-	if (DEBUG) fprintf(stderr, "remote_proxy__gc_from %lx for %lx\n", (long)from, (long)to);
-	RemoteProxy *rp = (RemoteProxy*)lua_touserdata(to, 1);
+	if (DEBUG) fprintf(stderr, "remote_proxy__gc_from %p for %p (%p)\n", from, gc_request->remote, gc_request->remote_main);
+	RemoteProxy *rp = (RemoteProxy*)lua_touserdata(gc_request->remote, 1);
 	// We're just going to trust this one is wired right.
 	lua_checkstack(from, 4);
 	lua_pushlightuserdata(from, rp->finaliser);
@@ -40,7 +45,7 @@ static int remote_proxy__gc_from(lua_State *from) {
 	// from: [obj]
 	if (DEBUG) fprintf(stderr, "remote_proxy__gc_from: type of object is %i\n", lua_type(from, -1));
 	if (lua_isnil(from, -1)) {
-		fprintf(stderr, "RemoteProxy lookup failed for %lx in %lx...\n", (long)to, (long)from);
+		fprintf(stderr, "RemoteProxy lookup failed for %lx in %lx...\n", (long)gc_request->remote, (long)from);
 		lua_pushstring(from, "RemoteProxy lookup failed");
 		lua_error(from);
 	}
@@ -48,10 +53,10 @@ static int remote_proxy__gc_from(lua_State *from) {
 	lua_pushnil(from);
 	lua_rawset(from, LUA_REGISTRYINDEX); // Delete from:registry[&pf]
 	// from: [obj]
-	lua_pushlightuserdata(from, to);
+	lua_pushlightuserdata(from, gc_request->remote_main);
 	lua_rawget(from, LUA_REGISTRYINDEX);
 	if (lua_isnil(from, -1)) {
-		fprintf(stderr, "Proxy cache lookup failed for %lx in %lx...\n", (long)rp, (long)from);
+		fprintf(stderr, "Proxy cache lookup failed for %lx in %lx...\n", (long)gc_request->remote, (long)from);
 		lua_pushstring(from, "Proxy cache lookup failed");
 		lua_error(from);
 	}
@@ -76,15 +81,15 @@ static int remote_proxy__gc_from(lua_State *from) {
 	lua_pushnil(from);
 	if (lua_next(from, -1) == 0) {
 		// Unlink the to state entirely if it's going to be empty.
-		if (DEBUG) fprintf(stderr, "Removing proxy cache in %lx for %lx\n", (long)from, (long)to);
-		lua_pushlightuserdata(from, to);
+		if (DEBUG) fprintf(stderr, "Removing proxy cache in %lx for %lx\n", (long)from, (long)gc_request->remote);
+		lua_pushlightuserdata(from, gc_request->remote_main);
 		lua_pushnil(from);
 		lua_rawset(from, LUA_REGISTRYINDEX); // Delete from:registry[to]
 		lua_pop(from, 2);
 	} else {
 		lua_pop(from, 4); // Plus the K/V pair at head of the table.
 	}
-	if (DEBUG) fprintf(stderr, "remote_proxy__gc_from %lx for %lx COMPLETE\n", (long)from, (long)to);
+	if (DEBUG) fprintf(stderr, "remote_proxy__gc_from %lx for %lx COMPLETE\n", (long)from, (long)gc_request->remote);
 	return 0;
 }
 
@@ -105,7 +110,8 @@ int remote_proxy__gc(lua_State *to) {
 	lua_State *from = rp->owner;
 	// We don't need to clean up our cache -- it's a weak value table and we're
 	// running gc, so the last reference is gone.
-	remote_cpcall(to, from, remote_proxy__gc_from);
+	GcRequest gc_request = {to, get_main_thread(to, to)};
+	handle_error_from(to, from, lua_cpcall(from, remote_proxy__gc_from, &gc_request));
 	if (DEBUG) fprintf(stderr, "remote_proxy__gc: %lx done\n", (long)rp);
 	return 0;
 }

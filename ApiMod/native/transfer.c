@@ -188,12 +188,25 @@ static void claim_proxy_finaliser(lua_State *to, ProxyFinaliser *pf) {
 		lua_error(to);
 		return; // Unreachable
 	} else {
+		if (DEBUG) fprintf(stderr, "Trying to get a proxy %p (%p) in thread %p.\n", pf->proxy, pf, to);
 		// It exists already; look up our own.
 		lua_pushlightuserdata(to, &REMOTE_PROXY_LOOKUP_KEY);
 		lua_rawget(to, LUA_REGISTRYINDEX);
 		// Table MUST exist as we made it with the proxy!!
 		lua_pushlightuserdata(to, pf->proxy);
 		lua_rawget(to, -2);
+		if (lua_isnil(to, -1)) {
+			if (DEBUG) fprintf(stderr, "Our RemoteProxy is dead but not yet collected.\n");
+			fprintf(stderr, "RemoteProxy %p in %p (%p) is dead but not yet collected.\n", pf->proxy, to, get_main_thread(to, to));
+			// The weak value table has eaten our RemoteProxy but
+			// not yet garbage collected it.
+			// It's going to die.
+			pf->proxy->dead = true;
+			pf->proxy->finaliser = NULL;
+			pf->proxy = NULL;
+			pf->dead = true;
+			claim_proxy_finaliser(to, pf);
+		}
 		lua_remove(to, -2);
 		// [rp]
 	}
