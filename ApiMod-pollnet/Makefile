@@ -29,9 +29,8 @@ pollnet.dll: dbroot $(RUST_SOURCES)
 check_sha256sums: .PHONY
 	sha256sum --check sha256sums
 
-MOD_CONTENTS=mod/init.lua pollnet/bindings/luajit/pollnet.lua
-OTHER_PACKAGE_CONTENTS=mod/mod.xml pollnet.dll
-PACKAGE_CONTENTS=$(MOD_CONTENTS) $(OTHER_PACKAGE_CONTENTS)
+MOD_CONTENTS=binding.patch pollnet/bindings/luajit/pollnet.lua
+PACKAGE_CONTENTS=mod/init.lua mod/mod.xml pollnet.dll
 
 sha256sums: $(PACKAGE_CONTENTS)
 	sha256sum $(PACKAGE_CONTENTS) > sha256sums
@@ -40,6 +39,8 @@ sha256sums: $(PACKAGE_CONTENTS)
 clean: .PHONY
 	rm -rf package dbroot pollnet.dll
 
+mod/init.lua: $(MOD_CONTENTS)
+	patch pollnet/bindings/luajit/pollnet.lua binding.patch -o mod/init.lua
+
 package: $(PACKAGE_CONTENTS) check_sha256sums
-	rsync $(OTHER_PACKAGE_CONTENTS) package/
-	sed < mod/init.lua -f insert_pollnet.sed > package/init.lua
+	rsync -r $(PACKAGE_CONTENTS) package/

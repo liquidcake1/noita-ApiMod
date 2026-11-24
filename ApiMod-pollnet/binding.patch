@@ -1,0 +1,59 @@
+0a1
+> pollnet = (function ()
+5c6
+< local LIBDIR = "./"
+---
+> local LIBDIR = "mods/ApiMod-pollnet/"
+106a108,137
+> -- Perhaps we don't have to do this. ffi will check for exact pointer
+> -- compatibility, as best as I can tell. Can we trust that this is well-formed?
+> -- sockethandle_t is just a uint64_t which sounds non-type-safe...
+> 
+> -- Make a metatable for fake_obj to turn transform fake_obj:foo(...) into
+> -- obj:foo(...)
+> -- This allows us to export fake_obj to other mods without them being able
+> -- to do anything naughty to obj, which is our "real" socket: no access to
+> -- _socket and no ability to use any method on anything else.
+> -- Baking the metatable like this means that the function has a stable
+> -- proxy, so can still be captured for a bit of speed with
+> --   f = obj.foo
+> --   f(obj, ...)  -- Same as obj:foo(...) but no proxy call to resolve foo
+> -- We raise an error if we're called as obj.foo(somthing_else)
+> local function force_obj(obj, mt)
+>   local idx = nil
+>   local forced_mt = {}
+>   local fake_obj = {}
+>   for name, fun in pairs(mt) do
+>     if name:byte(1) ~= 95 then -- skip _ functions
+>       forced_mt[name] = function (in_obj, ...)
+>         if in_obj ~= fake_obj then error("metatable function called with the wrong object; probably you did sock." .. name .. "(...) instead of sock:" .. name .. "(...). For safety, the functions are different for each sock, so you cannot call sock1.read(sock2). Perhaps you are attempting such shenanigans...?") end
+>         return fun(obj, ...)
+>       end
+>     end
+>   end
+>   setmetatable(obj, {__index = mt})  -- Allow metatable functions to call each other
+>   return setmetatable(fake_obj, {__index = forced_mt})
+> end
+> 
+109c140
+<   return setmetatable({}, {__index = socket_mt})
+---
+>   return force_obj({}, socket_mt)
+378,379c409,411
+<   local ret = setmetatable({}, {__index = reactor_mt})
+<   ret:init()
+---
+>   local obj = {}
+>   local ret = force_obj(obj, reactor_mt)
+>   obj:init()
+468,470c500,502
+<   init = init_ctx,
+<   init_hack_static = init_ctx_hack_static,
+<   shutdown = shutdown_ctx, 
+---
+>   -- init = init_ctx,
+>   -- init_hack_static = init_ctx_hack_static,
+>   -- shutdown = shutdown_ctx, 
+493a526,527
+> end)()
+> ApiMod.register("pollnet", pollnet)
