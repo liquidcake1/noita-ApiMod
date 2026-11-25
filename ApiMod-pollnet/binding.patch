@@ -53,7 +53,7 @@
 ---
 >   -- init = init_ctx,
 >   -- init_hack_static = init_ctx_hack_static,
->   -- shutdown = shutdown_ctx, 
+>   -- shutdown = shutdown_ctx,
 493a526,527
 > end)()
 > ApiMod.register("pollnet", pollnet)

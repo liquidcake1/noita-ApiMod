@@ -29,18 +29,23 @@ pollnet.dll: dbroot $(RUST_SOURCES)
 check_sha256sums: .PHONY
 	sha256sum --check sha256sums
 
-MOD_CONTENTS=binding.patch pollnet/bindings/luajit/pollnet.lua
 PACKAGE_CONTENTS=mod/init.lua mod/mod.xml pollnet.dll
 
 sha256sums: $(PACKAGE_CONTENTS)
 	sha256sum $(PACKAGE_CONTENTS) > sha256sums
 
+# This isn't directly used except by make-mod/init.lua, which you can run
+# optionally to verify it/if you pull pollnet and the patch seems to be undoing
+# changes made in the update.
+binding.patch: pollnet/bindings/luajit/pollnet.lua mod/init.lua
+	diff -Z pollnet/bindings/luajit/pollnet.lua mod/init.lua > binding.patch || true
+
+make-mod/init.lua: pollnet/bindings/luajit/pollnet.lua binding.patch
+	patch pollnet/bindings/luajit/pollnet.lua binding.patch -o mod/init.lua
+
 .PHONY:
 clean: .PHONY
 	rm -rf package dbroot pollnet.dll
 
-mod/init.lua: $(MOD_CONTENTS)
-	patch pollnet/bindings/luajit/pollnet.lua binding.patch -o mod/init.lua
-
-package: $(PACKAGE_CONTENTS) check_sha256sums
+package: $(PACKAGE_CONTENTS) check_sha256sums binding.patch
 	rsync -r $(PACKAGE_CONTENTS) package/
