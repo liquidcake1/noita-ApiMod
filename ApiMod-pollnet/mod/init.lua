@@ -1,4 +1,5 @@
-pollnet = (function ()
+do
+  local pollnet_binding = function ()
 -- pollnet bindings for luajit+ffi
 
 -- Change this as necessary to point to where [lib?]pollnet.dll|.so|.dylib
@@ -13,11 +14,8 @@ typedef uint64_t sockethandle_t;
 typedef uint32_t socketstatus_t;
 
 const char* pollnet_version();
-bool pollnet_handle_is_valid(sockethandle_t handle);
-sockethandle_t pollnet_invalid_handle();
 
 pollnet_ctx* pollnet_init();
-pollnet_ctx* pollnet_get_or_init_static();
 void pollnet_shutdown(pollnet_ctx* ctx);
 sockethandle_t pollnet_open_tcp(pollnet_ctx* ctx, const char* addr);
 sockethandle_t pollnet_listen_tcp(pollnet_ctx* ctx, const char* addr);
@@ -25,16 +23,11 @@ sockethandle_t pollnet_open_ws(pollnet_ctx* ctx, const char* url);
 sockethandle_t pollnet_simple_http_get(pollnet_ctx* ctx, const char* url, const char* headers, bool ret_body_only);
 sockethandle_t pollnet_simple_http_post(pollnet_ctx* ctx, const char* url, const char* headers, const char* data, uint32_t datasize, bool ret_body_only);
 void pollnet_close(pollnet_ctx* ctx, sockethandle_t handle);
-void pollnet_close_all(pollnet_ctx* ctx);
 void pollnet_send(pollnet_ctx* ctx, sockethandle_t handle, const char* msg);
 void pollnet_send_binary(pollnet_ctx* ctx, sockethandle_t handle, const unsigned char* msg, uint32_t msgsize);
 socketstatus_t pollnet_update(pollnet_ctx* ctx, sockethandle_t handle);
-socketstatus_t pollnet_update_blocking(pollnet_ctx* ctx, sockethandle_t handle);
 uint32_t pollnet_get_data_size(pollnet_ctx* ctx, sockethandle_t handle);
-uint32_t pollnet_get_data(pollnet_ctx* ctx, sockethandle_t handle, char* dest, uint32_t dest_size);
 const uint8_t* pollnet_unsafe_get_data_ptr(pollnet_ctx* ctx, sockethandle_t handle);
-void pollnet_clear_data(pollnet_ctx* ctx, sockethandle_t handle);
-uint32_t pollnet_get_error(pollnet_ctx* ctx, sockethandle_t handle, char* dest, uint32_t dest_size);
 sockethandle_t pollnet_get_connected_client_handle(pollnet_ctx* ctx, sockethandle_t handle);
 sockethandle_t pollnet_listen_ws(pollnet_ctx* ctx, const char* addr);
 sockethandle_t pollnet_serve_static_http(pollnet_ctx* ctx, const char* addr, const char* serve_dir);
@@ -43,7 +36,6 @@ sockethandle_t pollnet_serve_http(pollnet_ctx* ctx, const char* addr);
 void pollnet_add_virtual_file(pollnet_ctx* ctx, sockethandle_t handle, const char* filename, const char* filedata, uint32_t filesize);
 void pollnet_remove_virtual_file(pollnet_ctx* ctx, sockethandle_t handle, const char* filename);
 uint32_t pollnet_get_nanoid(char* dest, uint32_t dest_size);
-void pollnet_sleep_ms(uint32_t milliseconds);
 ]]
 
 local pollnet
@@ -74,6 +66,17 @@ do
   end
 end
 
+-- Save any globals we need, so the clear later doesn't break us.
+local assert = assert
+local error = error
+local ipairs = ipairs
+local pairs = pairs
+local print = print
+local setmetatable = setmetatable
+local table = table
+local tostring = tostring
+local type = type
+
 local POLLNET_RESULT_CODES = {
   [0] = "invalid_handle",
   [1] = "error",
@@ -90,19 +93,6 @@ local function init_ctx()
   if _ctx then return end
   _ctx = ffi.gc(pollnet.pollnet_init(), pollnet.pollnet_shutdown)
   assert(_ctx ~= nil)
-end
-
-local function init_ctx_hack_static()
-  if _ctx then return end
-  _ctx = pollnet.pollnet_get_or_init_static()
-  assert(_ctx ~= nil)
-  pollnet.pollnet_close_all(_ctx)
-end
-
-local function shutdown_ctx()
-  if not _ctx then return end
-  pollnet.pollnet_shutdown(ffi.gc(_ctx, nil))
-  _ctx = nil
 end
 
 -- Perhaps we don't have to do this. ffi will check for exact pointer
@@ -178,29 +168,6 @@ local function format_headers(headers)
     end
   end
   return table.concat(frags, "\n")
-end
-
-local function parse_headers(headers_str)
-  local headers = {}
-  for line in headers_str:gmatch("[^\n]+") do
-    local key, val = line:match("^([^:]*):(.*)$")
-    if key then headers[key:lower()] = val end
-  end
-  return headers
-end
-
-local function parse_query(s)
-  local queries = {[1]=s}
-  for k, v in s:gmatch("([^=&]+)=([^&]+)") do
-    queries[k] = v
-  end
-  return queries
-end
-
-local function parse_method(s)
-  local method, path, query = s:match("^(%w+) ([^?]+)%??(.*)$")
-  local queries = parse_query(query)
-  return method, path, queries
 end
 
 function socket_mt:http_get(url, headers, ret_body_only)
@@ -400,115 +367,15 @@ local function get_nanoid()
   return ffi.string(_id_scratch, msg_size)
 end
 
-local function sleep_ms(ms)
-  pollnet.pollnet_sleep_ms(ms)
-end
-
-local reactor_mt = {}
-local function Reactor()
-  local obj = {}
-  local ret = force_obj(obj, reactor_mt)
-  obj:init()
-  return ret
-end
-
-function reactor_mt:init()
-  self.threads = {}
-end
-
-function reactor_mt:run(thread_body)
-  local thread = coroutine.create(function()
-    thread_body(self)
-  end)
-  self.threads[thread] = true
-end
-
-function reactor_mt:run_server(server_sock, client_body)
-  server_sock:on_connection(function(client_sock, addr)
-    self:run(function()
-      client_body(client_sock, addr)
-    end)
-  end)
-  self:run(function()
-    while true do server_sock:await() end
-  end)
-end
-
-function reactor_mt:log(...)
-  print(...)
-end
-
-function reactor_mt:update()
-  local live_count = 0
-  local cur_threads = self.threads
-  self.threads = {}
-  for thread, _ in pairs(cur_threads) do
-    if coroutine.status(thread) == "dead" then
-      cur_threads[thread] = nil
-    else
-      live_count = live_count + 1
-      local happy, err = coroutine.resume(thread)
-      if not happy then self:log("Error", err) end
-    end
-  end
-  for thread, _ in pairs(self.threads) do
-    live_count = live_count + 1
-    cur_threads[thread] = true
-  end
-  self.threads = cur_threads
-  return live_count
-end
-
-local function invoke_handler(handler, req, expose_errors)
-  local happy, res = pcall(handler, req)
-  if happy then
-    return res
-  else
-    return {
-      status = "500",
-      body = (expose_errors and tostring(res)) or "Internal Error"
-    }
-  end
-end
-
-local function wrap_req_handler(handler, expose_errors)
-  return function(req_sock, addr)
-    while true do
-      local raw_req = req_sock:await_n(3)
-      if not raw_req then break end
-      local method, path, query = parse_method(raw_req[1])
-      local headers = parse_headers(raw_req[2])
-      local reply = invoke_handler(handler, {
-        addr = addr,
-        method = method,
-        path = path,
-        query = query,
-        headers = headers,
-        body = raw_req[3],
-        raw = raw_req
-      }, expose_errors)
-      req_sock:send(reply.status or "404")
-      req_sock:send(format_headers(reply.headers or {}))
-      req_sock:send_binary(reply.body or "")
-    end
-    req_sock:close()
-  end
-end
-
+-- exports are gutted: anything that's pure, mods can just define themselves:
+-- it'll be faster that way. The Reactor is highly unlikely to work via ApiMod
+-- (it involves changing coroutines, which you can't do over a C boundary), and
+-- is pure anyway. We don't expose init as that happens automatically, or
+-- shutdown because we never want to (let ffi.gc handle that).
 local exports = {
   VERSION = POLLNET_VERSION,
-  -- init = init_ctx,
-  -- init_hack_static = init_ctx_hack_static,
-  -- shutdown = shutdown_ctx,
   Socket = Socket,
-  Reactor = Reactor,
-  pollnet = pollnet,
-  nanoid = get_nanoid,
-  sleep_ms = sleep_ms,
-  format_headers = format_headers,
-  parse_headers = parse_headers,
-  parse_method = parse_method,
-  wrap_req_handler = wrap_req_handler
+  nanoid = get_nanoid,  -- Not useful, but harmless to expose.
 }
 
 local fnames = {
@@ -523,5 +390,29 @@ for _, name in ipairs(fnames) do
 end
 
 return exports
-end)()
-ApiMod.register("pollnet", pollnet)
+  end -- end pollnet wrapper function
+  ApiMod.register("pollnet", pollnet_binding())
+end
+
+-- Destroy all of our globals. Just in case anyone manages to escape into this
+-- state (eg. ModLuaFileAppend).
+-- The ffi is kept alive by the ApiMod state holding the bindings.
+do
+  local t = {}
+  for varname, _ in pairs(_G) do
+    table.insert(t, varname)
+  end
+  table.sort(t)
+  -- save some globals
+  local print = print
+  local collectgarbage = collectgarbage
+  for _, varname in ipairs(t) do
+    if varname ~= "_G" then
+      _G[varname] = nil
+    end
+  end
+  t = nil
+  collectgarbage()
+end
+
+-- Ne'er may ye achieve nowt again.
