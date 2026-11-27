@@ -33,7 +33,7 @@
 > local tostring = tostring
 > local type = type
 > 
-94,104c98,125
+94,104c98,129
 < local function init_ctx_hack_static()
 <   if _ctx then return end
 <   _ctx = pollnet.pollnet_get_or_init_static()
@@ -73,12 +73,16 @@
 >     end
 >   end
 >   setmetatable(obj, {__index = mt})  -- Allow metatable functions to call each other
->   return setmetatable(fake_obj, {__index = forced_mt})
-109c130
+>   -- We don't really need to disable __apimod_settable, as we never use
+>   -- fake_obj, but it's less confusing to just get an error. If we allowed it,
+>   -- a remote mod could add methods of their own to the socket and store data
+>   -- in it, but everything would need proxying twice to run them.
+>   return setmetatable(fake_obj, {__index = forced_mt, __apimod_settable = false})
+109c134
 <   return setmetatable({}, {__index = socket_mt})
 ---
 >   return force_obj({}, socket_mt)
-152,174d172
+152,174d176
 < local function parse_headers(headers_str)
 <   local headers = {}
 <   for line in headers_str:gmatch("[^\n]+") do
@@ -102,7 +106,7 @@
 <   return method, path, queries
 < end
 < 
-372,465c370,374
+372,465c374,378
 < local function sleep_ms(ms)
 <   pollnet.pollnet_sleep_ms(ms)
 < end
@@ -203,11 +207,11 @@
 > -- (it involves changing coroutines, which you can't do over a C boundary), and
 > -- is pure anyway. We don't expose init as that happens automatically, or
 > -- shutdown because we never want to (let ffi.gc handle that).
-468,470d376
+468,470d380
 <   init = init_ctx,
 <   init_hack_static = init_ctx_hack_static,
 <   shutdown = shutdown_ctx, 
-472,479c378
+472,479c382
 <   Reactor = Reactor,
 <   pollnet = pollnet,
 <   nanoid = get_nanoid,
@@ -218,7 +222,7 @@
 <   wrap_req_handler = wrap_req_handler
 ---
 >   nanoid = get_nanoid,  -- Not useful, but harmless to expose.
-493a393,418
+493a397,422
 >   end -- end pollnet wrapper function
 >   ApiMod.register("pollnet", pollnet_binding())
 > end

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <lauxlib.h>
 #include <lua.h>
 #include "proxy.h"
 #include "destroy_proxy.h"
@@ -52,6 +53,54 @@ static int remote_proxy__index(lua_State *to) {
 	return 1;
 }
 
+// In "from", we're doing rp[key] = val on a RemoteProxy userdata. Proxying is handled by pcall_transfer.
+// Params: [table, key, val]
+// Return: []
+static int remote_proxy__newindex_inner(lua_State *from) {
+	if (DEBUG) printf("remote_proxy__newindex_inner\n");
+	// Reasonably, we shouldn't get a call except from
+	// remote_proxy__newindex, which guarantees a stack of exactly 3.
+	// We're using absolute indexes though, so let's just be safe.
+	luaL_checkany(from, 3);
+	lua_settop(from, 3);
+	lua_getmetatable(from, 1);
+	if (lua_isnil(from, -1)) {
+		lua_pop(from, 1); // The metatable
+	} else {
+		lua_pushstring(from, "__apimod_settable");
+		lua_gettable(from, -2);
+		switch(lua_type(from, -1)) {
+		case LUA_TNIL:
+			break;
+		case LUA_TFUNCTION:
+			lua_insert(from, 1);
+			lua_pop(from, 1); // The metatable
+			lua_call(from, 3, 0);
+			return 0;
+		default:
+			// If it's a table or a userdata, run the set on that.
+			// If it's something else, this will just error.
+			lua_replace(from, 1);
+			lua_pop(from, 1); // The metatable
+			lua_settable(from, 1);
+			return 0;
+		}
+		lua_pop(from, 2); // The metatable, and the nil __apimod_settable value.
+	}
+	lua_settable(from, 1);
+	return 0;
+}
+
+// In "to", we're doing rp[key] on a RemoteProxy userdata.
+// Params: [rp for func, arg1, ..., argn]
+// Return: [transfer(table[transfer(key)])]
+static int remote_proxy__newindex(lua_State *to) {
+	if (DEBUG) printf("remote_proxy__newindex\n");
+	int nargs = lua_gettop(to) - 1;
+	remote_proxy_inner(to, remote_proxy__newindex_inner, nargs + 1, LUA_MULTRET);
+	return lua_gettop(to);
+}
+
 // In "from", we're doing func(arg1, ..., argn) for a function proxied from "to". Proxying is handled by pcall_transfer.
 // Params: [func, arg1, ..., argn]
 // Return: [ret1, ..., retn]
@@ -93,6 +142,9 @@ void ensure_remote_proxy_metatable(lua_State *to) {
 		lua_rawset(to, -3);
 		lua_pushstring(to, "__index");
 		lua_pushcfunction(to, remote_proxy__index);
+		lua_rawset(to, -3);
+		lua_pushstring(to, "__newindex");
+		lua_pushcfunction(to, remote_proxy__newindex);
 		lua_rawset(to, -3);
 		// It's not the end of the world if a mod gets ahold of the
 		// metatable, as we always check that the first parameter

@@ -122,7 +122,11 @@ local function force_obj(obj, mt)
     end
   end
   setmetatable(obj, {__index = mt})  -- Allow metatable functions to call each other
-  return setmetatable(fake_obj, {__index = forced_mt})
+  -- We don't really need to disable __apimod_settable, as we never use
+  -- fake_obj, but it's less confusing to just get an error. If we allowed it,
+  -- a remote mod could add methods of their own to the socket and store data
+  -- in it, but everything would need proxying twice to run them.
+  return setmetatable(fake_obj, {__index = forced_mt, __apimod_settable = false})
 end
 
 local socket_mt = {}
