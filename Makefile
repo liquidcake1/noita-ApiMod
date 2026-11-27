@@ -17,3 +17,12 @@ run: install
 	cd Noita; env WINEPREFIX=$(CURDIR)/wineprefix wine noita.exe
 run_dev: install
 	cd Noita; env WINEPREFIX=$(CURDIR)/wineprefix wine noita_dev.exe
+
+.PHONY:
+ApiMod/native/test.exe: .PHONY
+	$(MAKE) -C ApiMod/native test.exe
+
+TESTS = ${shell find tests -name '*.lua' -printf "../%p\n" | sort}
+
+test: ApiMod/native/test.exe
+	cd Noita && wine ../ApiMod/native/test.exe ../ApiMod/mod/init.lua ../ApiMod-pollnet/mod/init.lua $(TESTS)
