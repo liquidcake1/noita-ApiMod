@@ -33,4 +33,4 @@ dbroot:
 
 dbroot/build/api_mod.dll: dbroot $(SOURCES) $(EXT_SOURCES) $(BUILD_DEPS)
 	rsync --delete --delete-excluded --exclude=.git -a *.[ch] lua51.def Makefile luajit minhook dbroot/build
-	fakechroot fakeroot chroot dbroot bash -c 'cd /build && make api_mod.dll'
+	env -i PATH=/bin:/usr/bin fakechroot fakeroot chroot dbroot bash -c 'cd /build && make api_mod.dll'
