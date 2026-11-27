@@ -72,6 +72,12 @@ static int remote_proxy__call(lua_State *to) {
 	return lua_gettop(to);
 }
 
+int no_metatable_access(lua_State *L) {
+	lua_pushstring(L, "no_metatable_access: metatable of ApiMod internals cannot be accessed from Lua");
+	lua_error(L);
+	return 0; // Unreachable
+}
+
 // Either make a new RemoteProxy metatable, or use the existing one if it's there. Leave it on the stack.
 void ensure_remote_proxy_metatable(lua_State *to) {
 	lua_pushlightuserdata(to, &REMOTE_PROXY_METATABLE_KEY);
@@ -88,9 +94,16 @@ void ensure_remote_proxy_metatable(lua_State *to) {
 		lua_pushstring(to, "__index");
 		lua_pushcfunction(to, remote_proxy__index);
 		lua_rawset(to, -3);
+		// It's not the end of the world if a mod gets ahold of the
+		// metatable, as we always check that the first parameter
+		// is a RemoteProxy userdata anyway.
+		// Still, let's just not let too many shenanigans happen;
+		// there's only one of these per state and if it's edited,
+		// it'll affect all RemoteProxy objects there, which is probably
+		// not what they wanted.
 		lua_pushstring(to, "__metatable");
-		lua_pushnil(to);
-		lua_rawset(to, -3); // DISABLES fetching metatable
+		lua_pushcfunction(to, no_metatable_access);
+		lua_rawset(to, -3);
 		lua_pushlightuserdata(to, &REMOTE_PROXY_METATABLE_KEY);
 		lua_pushvalue(to, -2);
 		lua_rawset(to, LUA_REGISTRYINDEX);
@@ -107,9 +120,12 @@ void ensure_proxy_finaliser_metatable(lua_State *from) {
 		lua_pushstring(from, "__gc");
 		lua_pushcfunction(from, proxy_finaliser__gc);
 		lua_rawset(from, -3);
+		// We hide the metatable, though since ProxyFinalisers never
+		// leave the registry, there is no way for Lua to query it
+		// anyway.
 		lua_pushstring(from, "__metatable");
-		lua_pushnil(from);
-		lua_rawset(from, -3); // DISABLES fetching metatable
+		lua_pushcfunction(from, no_metatable_access);
+		lua_rawset(from, -3);
 		lua_pushlightuserdata(from, &PROXY_FINALISER_METATABLE_KEY);
 		lua_pushvalue(from, -2);
 		lua_rawset(from, LUA_REGISTRYINDEX);
