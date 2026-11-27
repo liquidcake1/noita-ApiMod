@@ -24,5 +24,6 @@ ApiMod/native/test.exe: .PHONY
 
 TESTS = ${shell find tests -name '*.lua' -printf "../%p\n" | sort}
 
-test: ApiMod/native/test.exe
+# Needs Noita/lua51.dll but nothing else.
+test: ApiMod/native/test.exe install
 	cd Noita && wine ../ApiMod/native/test.exe ../ApiMod/mod/init.lua ../ApiMod-pollnet/mod/init.lua $(TESTS)
