@@ -21,7 +21,7 @@ pollnet.dll: dbroot $(RUST_SOURCES)
 	rsync --delete -r --exclude=target pollnet/. dbroot/build/
 	# Woo, hidden only half-documented environment variables! I had to steal these from
 	# Claude, too; there seems to be really scant docs on how to do this stuff.
-	env -i PATH=/bin:/usr/bin fakechroot fakeroot chroot dbroot bash -c 'cd /build && RUSTUP_TOOLCHAIN=1.100.0 CARGO_TARGET_I686_PC_WINDOWS_GNU_LINKER=i686-w64-mingw32-gcc RUSTFLAGS="-C link-arg=-Wl,--no-insert-timestamp" cargo build --target=i686-pc-windows-gnu --release --locked'
+	fakechroot fakeroot chroot dbroot bash -c 'cd /build && RUSTUP_TOOLCHAIN=1.100.0 CARGO_TARGET_I686_PC_WINDOWS_GNU_LINKER=i686-w64-mingw32-gcc RUSTFLAGS="-C link-arg=-Wl,--no-insert-timestamp" cargo build --target=i686-pc-windows-gnu --release --locked'
 	rsync dbroot/build/target/i686-pc-windows-gnu/release/pollnet.dll .
 
 # Strictly, depends on sha256sums but if it does then it will always pass...
